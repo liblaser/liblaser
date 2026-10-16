@@ -21,10 +21,14 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
  *****************************************************************************/
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/types.h>
 
 #include "laser.h"
@@ -74,16 +78,17 @@ static int udf_read_cb(struct udfread_block_input *bi, uint32_t lba,
     return ret;
 }
 
-/** Copy a NUL-terminated UTF-8 string into a laser_disc_t::volume_id,
- * truncating on a sequence boundary rather than on a byte, so that the result
- * is still UTF-8 - the consumer hands it to a Java String. While the first
- * byte cut off is a continuation byte (10xxxxxx), the cut moves left. */
-static void copy_volume_id(char *dst, const char *src)
+/** Copy a NUL-terminated UTF-8 string into a laser_disc_t field of
+ * @p dst_size bytes, truncating on a sequence boundary rather than on a byte,
+ * so that the result is still UTF-8 - the consumer hands it to a Java String.
+ * While the first byte cut off is a continuation byte (10xxxxxx), the cut
+ * moves left. */
+static void copy_utf8(char *dst, size_t dst_size, const char *src)
 {
     size_t len = strlen(src);
 
-    if (len > LASER_DISC_VOLUME_ID_MAX - 1) {
-        len = LASER_DISC_VOLUME_ID_MAX - 1;
+    if (len > dst_size - 1) {
+        len = dst_size - 1;
 
         while (len > 0 && ((unsigned char)src[len] & 0xC0) == 0x80)
             len--;
@@ -136,15 +141,335 @@ static bool udf_zone_present(udfread *udf, const char *path, const char *magic)
 #define UDF_AUDIO_ZONE_IFO   "/AUDIO_TS/AUDIO_TS.IFO"
 #define UDF_AUDIO_ZONE_MAGIC "DVDAUDIO-AMG"
 
+/* ============================================================================
+ * BD-Video title, from the disc library metadata
+ * ============================================================================
+ * /BDMV/META/DL holds one bdmt_<lang>.xml per language, <lang> being an
+ * ISO 639-2 code, and the title is the text of <di:name> inside
+ * <di:discinfo>. That directory is not encrypted - AACS covers the streams -
+ * so no key is involved. A scanner rather than an XML library: one element is
+ * wanted, from a file of a few KB.
+ * ============================================================================ */
+
+#define BDMT_DIR      "/BDMV/META/DL"
+#define BDMT_NAME_LEN 12            /* "bdmt_" + 3-letter code + ".xml" */
+#define BDMT_MAX_SIZE (64 * 1024)   /* bound on the bytes read from one file */
+
+/** Rank of a directory entry as a title source, lower is better: the index
+ * of its code in @p langs, then "eng", then any other language. -1 for a
+ * name that is not a bdmt file. */
+static int bdmt_rank(const char *name, const char *const *langs)
+{
+    if (strlen(name) != BDMT_NAME_LEN || strncasecmp(name, "bdmt_", 5) != 0 ||
+        strcasecmp(name + 8, ".xml") != 0)
+        return -1;
+
+    const char *code = name + 5;
+    int i = 0;
+
+    if (langs != NULL)
+        for (; langs[i] != NULL; i++)
+            if (strlen(langs[i]) == 3 && strncasecmp(code, langs[i], 3) == 0)
+                return i;
+
+    return strncasecmp(code, "eng", 3) == 0 ? i : i + 1;
+}
+
+/** Path of the best-ranked bdmt file into @p path, false if there is none. */
+static bool bdmt_pick(udfread *udf, const char *const *langs, char *path,
+                      size_t path_size)
+{
+    UDFDIR *dir = udfread_opendir(udf, BDMT_DIR);
+    if (dir == NULL)
+        return false;
+
+    int best = INT_MAX;
+    struct udfread_dirent ent;
+
+    while (udfread_readdir(dir, &ent) != NULL)
+    {
+        if (ent.d_type == UDF_DT_DIR)
+            continue;
+
+        int rank = bdmt_rank(ent.d_name, langs);
+        if (rank >= 0 && rank < best)
+        {
+            best = rank;
+            snprintf(path, path_size, BDMT_DIR "/%s", ent.d_name);
+        }
+    }
+
+    udfread_closedir(dir);
+    return best != INT_MAX;
+}
+
+/** Is [p, p + len) the tag name @p local, whatever its namespace prefix? */
+static bool xml_tag_is(const char *p, size_t len, const char *local)
+{
+    const char *colon = memchr(p, ':', len);
+    if (colon != NULL)
+    {
+        len -= (size_t)(colon + 1 - p);
+        p = colon + 1;
+    }
+    return len == strlen(local) && memcmp(p, local, len) == 0;
+}
+
+/** Is @p cp a valid, printable character? */
+static bool cp_printable(unsigned long cp)
+{
+    return cp >= 0x20 && (cp < 0xD800 || cp > 0xDFFF) && cp <= 0x10FFFF;
+}
+
+/** Append the printable code point @p cp to @p o as UTF-8, and return the
+ * byte after it. */
+static char *utf8_put(char *o, unsigned long cp)
+{
+    if (cp < 0x80)
+        *o++ = (char)cp;
+    else if (cp < 0x800)
+    {
+        *o++ = (char)(0xC0 | (cp >> 6));
+        *o++ = (char)(0x80 | (cp & 0x3F));
+    }
+    else if (cp < 0x10000)
+    {
+        *o++ = (char)(0xE0 | (cp >> 12));
+        *o++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+        *o++ = (char)(0x80 | (cp & 0x3F));
+    }
+    else
+    {
+        *o++ = (char)(0xF0 | (cp >> 18));
+        *o++ = (char)(0x80 | ((cp >> 12) & 0x3F));
+        *o++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+        *o++ = (char)(0x80 | (cp & 0x3F));
+    }
+    return o;
+}
+
+/** Is @p s well-formed UTF-8? A file that is not would reach a Java String
+ * through the consumer, which must not be handed one. */
+static bool utf8_valid(const unsigned char *s)
+{
+    while (*s != '\0')
+    {
+        unsigned char c = *s++;
+        int more;
+        unsigned long cp;
+
+        if (c < 0x80)
+            continue;
+        else if ((c & 0xE0) == 0xC0) { more = 1; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { more = 2; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { more = 3; cp = c & 0x07; }
+        else
+            return false;
+
+        for (int i = 0; i < more; i++)
+        {
+            if ((*s & 0xC0) != 0x80)
+                return false;
+            cp = (cp << 6) | (*s++ & 0x3F);
+        }
+
+        static const unsigned long min[] = { 0, 0x80, 0x800, 0x10000 };
+        if (cp < min[more] || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+            return false;
+    }
+    return true;
+}
+
+/** Decode the character data [p, p + len) into @p dst, which may be @p p
+ * itself since decoding never lengthens it: the five predefined entities and
+ * numeric references are resolved, and runs of whitespace become one space,
+ * trimmed at both ends. A reference to no printable character counts as
+ * whitespace; an unknown entity is kept as written. */
+static void xml_decode_text(const char *p, size_t len, char *dst)
+{
+    static const struct { const char *name; char c; } entities[] = {
+        { "amp", '&' }, { "lt", '<' }, { "gt", '>' },
+        { "quot", '"' }, { "apos", '\'' },
+    };
+    const char *end = p + len;
+    char *o = dst;
+    bool space = false;
+
+    while (p < end)
+    {
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        {
+            space = o != dst;
+            p++;
+            continue;
+        }
+
+        /* What to write: one byte as it is, or a decoded code point. */
+        char c = *p;
+        unsigned long cp = 0;
+        bool is_cp = false;
+        const char *next = p + 1;
+
+        const char *semi = c == '&' ? memchr(p, ';', (size_t)(end - p)) : NULL;
+        if (semi != NULL && p[1] == '#')
+        {
+            bool hex = p[2] == 'x' || p[2] == 'X';
+            char *num_end;
+            cp = strtoul(p + (hex ? 3 : 2), &num_end, hex ? 16 : 10);
+            if (num_end == semi)
+            {
+                is_cp = true;
+                next = semi + 1;
+            }
+        }
+        else if (semi != NULL)
+        {
+            size_t n = (size_t)(semi - (p + 1));
+            for (size_t i = 0; i < sizeof(entities) / sizeof(entities[0]); i++)
+                if (strlen(entities[i].name) == n &&
+                    memcmp(p + 1, entities[i].name, n) == 0)
+                {
+                    c = entities[i].c;
+                    next = semi + 1;
+                    break;
+                }
+        }
+
+        p = next;
+        if (is_cp && !cp_printable(cp))
+        {
+            space = o != dst;
+            continue;
+        }
+
+        if (space)
+        {
+            *o++ = ' ';
+            space = false;
+        }
+        if (is_cp)
+            o = utf8_put(o, cp);
+        else
+            *o++ = c;
+    }
+    *o = '\0';
+}
+
+/** Find the text of the first <name> inside <discinfo>, namespace prefixes
+ * ignored, in the NUL-terminated document @p xml. Decoded in place into
+ * @p xml itself, which the caller owns; NULL when there is none. */
+static char *bdmt_find_name(char *xml)
+{
+    char *p = xml;
+    bool in_discinfo = false;
+
+    while ((p = strchr(p, '<')) != NULL)
+    {
+        p++;
+
+        if (strncmp(p, "!--", 3) == 0)
+        {
+            p = strstr(p + 3, "-->");
+            if (p == NULL)
+                return NULL;
+            continue;
+        }
+
+        bool closing = *p == '/';
+        if (closing)
+            p++;
+
+        const char *tag = p;
+        while (*p != '\0' && *p != '>' && *p != '/' && *p != ' ' &&
+               *p != '\t' && *p != '\r' && *p != '\n')
+            p++;
+        size_t tag_len = (size_t)(p - tag);
+
+        char *gt = strchr(p, '>');
+        if (gt == NULL)
+            return NULL;
+        bool empty = gt[-1] == '/';
+
+        if (xml_tag_is(tag, tag_len, "discinfo"))
+            in_discinfo = !closing && !empty;
+        else if (in_discinfo && !closing && !empty &&
+                 xml_tag_is(tag, tag_len, "name"))
+        {
+            char *text = gt + 1;
+            char *text_end = strchr(text, '<');
+            if (text_end == NULL)
+                return NULL;
+            xml_decode_text(text, (size_t)(text_end - text), text);
+            return text;
+        }
+
+        p = gt + 1;
+    }
+    return NULL;
+}
+
+/** Read the BD-Video title into @p title (LASER_DISC_TITLE_MAX bytes), left
+ * empty when the disc has no usable metadata - the caller falls back to the
+ * volume label. */
+static void bdmt_read_title(udfread *udf, int token, const char *const *langs,
+                            char *title)
+{
+    char path[sizeof(BDMT_DIR) + BDMT_NAME_LEN + 1];
+
+    if (!bdmt_pick(udf, langs, path, sizeof(path)))
+    {
+        LOGI("token=%d: no disc library metadata in %s", token, BDMT_DIR);
+        return;
+    }
+
+    UDFFILE *f = udfread_file_open(udf, path);
+    if (f == NULL)
+    {
+        LOGI("token=%d: %s: cannot open", token, path);
+        return;
+    }
+
+    int64_t size = udfread_file_size(f);
+    if (size <= 0 || size > BDMT_MAX_SIZE)
+        size = BDMT_MAX_SIZE;
+
+    char *xml = malloc((size_t)size + 1);
+    ssize_t got = -1;
+    if (xml != NULL)
+        got = udfread_file_read(f, xml, (size_t)size);
+    udfread_file_close(f);
+
+    if (got <= 0)
+    {
+        LOGI("token=%d: %s: cannot read", token, path);
+        free(xml);
+        return;
+    }
+    xml[got] = '\0';
+
+    const char *name = bdmt_find_name(xml);
+    if (name == NULL || name[0] == '\0' ||
+        !utf8_valid((const unsigned char *)name))
+        LOGI("token=%d: %s: no usable title", token, path);
+    else
+    {
+        copy_utf8(title, LASER_DISC_TITLE_MAX, name);
+        LOGI("token=%d: %s: title \"%s\"", token, path, title);
+    }
+
+    free(xml);
+}
+
 /** Mounts the medium's UDF filesystem once and answers every UDF question
  * from it, filling volume_id (LASER_DISC_VOLUME_ID_MAX bytes) when something
- * was recognised. Mounting is the expensive part; each probe after it is a
+ * was recognised, and title (LASER_DISC_TITLE_MAX bytes) for a BD-Video. Mounting is the expensive part; each probe after it is a
  * path lookup, plus a 12-byte read where the lookup hits.
  *
  * Order: the Video zone first, as the commonest. If present, the Audio zone
  * too, since a universal disc has both. If absent, BD-Video before the Audio
  * zone, so that a Blu-ray pays no lookup for a zone it cannot have. */
-static udf_disc_t detect_udf_disc(int token, char *volume_id)
+static udf_disc_t detect_udf_disc(int token, const char *const *langs,
+                                  char *volume_id, char *title)
 {
     udf_disc_t kind = UDF_DISC_NONE;
 
@@ -191,6 +516,7 @@ static udf_disc_t detect_udf_disc(int token, char *volume_id)
             {
                 kind = UDF_DISC_BD;
                 udfread_file_close(f);
+                bdmt_read_title(udf, token, langs, title);
             }
             else
             {
@@ -207,7 +533,7 @@ static udf_disc_t detect_udf_disc(int token, char *volume_id)
         {
             const char *vol_id = udfread_get_volume_id(udf);
             if (vol_id != NULL)
-                copy_volume_id(volume_id, vol_id);
+                copy_utf8(volume_id, LASER_DISC_VOLUME_ID_MAX, vol_id);
             else
                 volume_id[0] = '\0';
         }
@@ -637,9 +963,10 @@ static const char *laser_disc_kind_name(laser_disc_kind_t kind)
 
 /* Each detector writes out->volume_id only when it recognises something, so
  * a miss leaves the empty label for the next one. */
-static bool identify_udf(int token, laser_disc_t *out)
+static bool identify_udf(int token, const char *const *langs,
+                         laser_disc_t *out)
 {
-    switch (detect_udf_disc(token, out->volume_id))
+    switch (detect_udf_disc(token, langs, out->volume_id, out->title))
     {
         case UDF_DISC_DVD_VIDEO:
             out->kind = LASER_DISC_DVD_VIDEO;
@@ -683,7 +1010,8 @@ static bool identify_iso(int token, uint32_t track_lba, laser_disc_t *out)
     return false;
 }
 
-void laser_disc_identify(int token, laser_disc_t *out)
+void laser_disc_identify_lang(int token, const char *const *langs,
+                              laser_disc_t *out)
 {
     /* Zeroed first, so that every path that recognises nothing leaves
      * LASER_DISC_UNKNOWN and an empty label. */
@@ -737,13 +1065,18 @@ void laser_disc_identify(int token, laser_disc_t *out)
         identify_iso(token, track_lba, out))
         goto done;
 
-    if (identify_udf(token, out))
+    if (identify_udf(token, langs, out))
         goto done;
 
     if (medium == MEDIUM_UNKNOWN && toc == CD_TOC_DATA)
         identify_iso(token, track_lba, out);
 
 done:
-    LOGI("token=%d: identified as %s, volume id \"%s\"", token,
-         laser_disc_kind_name(out->kind), out->volume_id);
+    LOGI("token=%d: identified as %s, volume id \"%s\", title \"%s\"", token,
+         laser_disc_kind_name(out->kind), out->volume_id, out->title);
+}
+
+void laser_disc_identify(int token, laser_disc_t *out)
+{
+    laser_disc_identify_lang(token, NULL, out);
 }

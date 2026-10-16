@@ -45,6 +45,10 @@ extern "C" {
  * truncated, on a character boundary, rather than rejected. */
 #define LASER_DISC_VOLUME_ID_MAX 33
 
+/** Size of laser_disc_t::title, including the terminator. A longer title is
+ * truncated on a character boundary, like a volume label. */
+#define LASER_DISC_TITLE_MAX 256
+
 typedef enum {
     /** Not recognised: a data disc, an empty drive or a read failure alike,
      * since no consumer acts differently on them. Should that change, the
@@ -75,6 +79,15 @@ typedef struct {
      *
      * Empty is not an error: callers fall back to a name of their own. */
     char volume_id[LASER_DISC_VOLUME_ID_MAX];
+
+    /** Disc title, NUL-terminated UTF-8, empty when there is none.
+     *
+     * For BD-Video only: the name the disc's author gave it, from the disc
+     * library metadata (/BDMV/META/DL/bdmt_<lang>.xml), in the language
+     * picked as laser_disc_identify_lang() describes. Unlike volume_id, it is
+     * meant to be shown as it is. Empty for every other kind, and for a
+     * Blu-ray without that metadata: callers fall back to volume_id. */
+    char title[LASER_DISC_TITLE_MAX];
 } laser_disc_t;
 
 /**
@@ -90,8 +103,8 @@ typedef struct {
  * 30 s and without cancellation. A ready drive costs one TEST UNIT READY.
  *
  * BEST EFFORT, AND NEVER FATAL. @p out is always filled: an unreadable or
- * unrecognised disc yields LASER_DISC_UNKNOWN and an empty volume_id, the
- * same answer as an empty drive.
+ * unrecognised disc yields LASER_DISC_UNKNOWN and an empty volume_id and
+ * title, the same answer as an empty drive.
  *
  * Detection order, each step skipped once an earlier one has answered:
  *
@@ -107,7 +120,8 @@ typedef struct {
  *      kind: the Video zone by /VIDEO_TS/VIDEO_TS.IFO and its "DVDVIDEO-VMG"
  *      magic, the Audio zone by /AUDIO_TS/AUDIO_TS.IFO and its
  *      "DVDAUDIO-AMG" magic, BD-Video by /BDMV/index.bdmv. A disc with both
- *      DVD zones is LASER_DISC_DVD_UNIVERSAL.
+ *      DVD zones is LASER_DISC_DVD_UNIVERSAL. On a BD-Video, the title is
+ *      read on the same open filesystem.
  *
  * When the medium is unknown, step 3 runs after step 4 rather than before,
  * DVDs being the likelier answer there.
@@ -130,10 +144,31 @@ typedef struct {
  * The wait above also consumes the UNIT ATTENTION of a swap, which another
  * consumer of the token then never sees.
  *
+ * A Blu-ray's title comes in English when the disc has it, otherwise in the
+ * first language listed: laser_disc_identify_lang() with no preference.
+ *
  * @param token the registry token (the fd, see laser.h)
  * @param out   filled on every path; must not be NULL
  */
 void laser_disc_identify(int token, laser_disc_t *out);
+
+/**
+ * laser_disc_identify(), with a preferred language for a Blu-ray's title.
+ *
+ * A Blu-ray carries one metadata file per language, named by an ISO 639-2
+ * code. The first of @p langs present is used, then "eng", then the first
+ * file listed. ISO 639-2 has two forms for some languages (fra and fre), and
+ * authors use either, so a caller converting from another form should pass
+ * both.
+ *
+ * @param token the registry token (the fd, see laser.h)
+ * @param langs preferred title languages, three-letter ISO 639-2 codes in
+ *              order of preference, case insensitive, NULL-terminated; NULL
+ *              for no preference
+ * @param out   filled on every path; must not be NULL
+ */
+void laser_disc_identify_lang(int token, const char *const *langs,
+                              laser_disc_t *out);
 
 #ifdef __cplusplus
 }
