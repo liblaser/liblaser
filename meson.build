@@ -62,6 +62,9 @@ laser_public_symbols = [
     'laser_region_mismatch',
     'laser_disc_identify',
     'laser_disc_identify_lang',
+    'laser_media_poll',
+    'laser_media_lock',
+    'laser_media_eject',
 ]
 
 libusb_inc = include_directories('contrib/libusb/libusb')

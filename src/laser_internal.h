@@ -217,10 +217,16 @@ typedef struct {
 
     /* Raised during laser_wait_until_ready() and cleared when the unit
      * answers ready, so it remains set only on a drive whose last wait ran
-     * out.
+     * out. Also cleared by laser_media_poll() on a new medium, which that
+     * wait did not see.
      * Registration succeeds either way; laser_disc_identify() reads it to
      * skip probes that would each spend a retry budget for nothing. */
     int             not_ready;
+
+    /* Set once the drive has failed to answer GET EVENT STATUS NOTIFICATION
+     * for the media class: laser_media_poll() then asks TEST UNIT READY. Not
+     * locked: a poll that reads it stale asks the 4Ah once more. */
+    int             media_events_unsupported;
 } laser_entry_t;
 
 /**

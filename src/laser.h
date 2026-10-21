@@ -546,6 +546,81 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
 int laser_region_mismatch(int token, uint8_t *drive_mask, uint8_t *disc_mask);
 
 /* ============================================================================
+ * The medium: what happened to it, and the tray
+ *
+ * USB Bulk-Only Transport has no way for the drive to speak first, so a
+ * change of disc is learnt by asking: laser_media_poll(), every second or
+ * two, from whoever wants to follow the drive. One command per call, which
+ * does not spin the disc up.
+ * ========================================================================= */
+
+/** What the drive reports having happened since the previous poll. */
+typedef enum {
+    LASER_MEDIA_NO_EVENT = 0,
+    /** The eject button was pressed and the drive did not act on it: the
+     * tray is locked (laser_media_lock()). */
+    LASER_MEDIA_EJECT_REQUEST,
+    /** A medium was loaded, or replaced by another: identify it again. */
+    LASER_MEDIA_NEW,
+    /** The medium was taken out. */
+    LASER_MEDIA_REMOVED,
+} laser_media_event_t;
+
+/** Whether a medium is in the drive. */
+typedef enum {
+    /** Not said. Always so from a drive answering GET EVENT STATUS
+     * NOTIFICATION, whose "medium present" bit has been seen wrong while a
+     * disc spins up: the events are what to act on. */
+    LASER_MEDIUM_UNKNOWN = 0,
+    LASER_MEDIUM_ABSENT,
+    LASER_MEDIUM_PRESENT,
+} laser_medium_t;
+
+typedef struct {
+    laser_media_event_t event;
+    /** 1 if the tray is open, 0 if closed or not known. */
+    int tray_open;
+    laser_medium_t medium;
+} laser_media_status_t;
+
+/**
+ * Ask the drive what happened to its medium since the last call.
+ *
+ * GET EVENT STATUS NOTIFICATION (4Ah), polled, media class: the event, which
+ * is reported once and then forgotten, and the tray. A drive that does not
+ * implement it is asked TEST UNIT READY instead, from then on: its sense
+ * gives the medium and the tray, and a MEDIUM MAY HAVE CHANGED becomes
+ * LASER_MEDIA_NEW. That one is a UNIT ATTENTION, consumed by being read:
+ * whoever polls is then the one told of a swap.
+ *
+ * Events are consumed too: several consumers polling one token share them,
+ * each seeing only the ones the others have not read.
+ *
+ * @param token the registry token; a claim must be held. A poller keeps one
+ *              between calls, or each call would register the device anew.
+ * @param out   filled on LASER_OK; must not be NULL.
+ * @return LASER_OK, LASER_ERR_NO_DEVICE, LASER_ERR_CANCELLED,
+ *         LASER_ERR_NO_SUCH_TOKEN, LASER_ERR_INVALID (NULL @p out), or
+ *         LASER_ERR_IO when the drive answered neither command.
+ */
+laser_status_t laser_media_poll(int token, laser_media_status_t *out);
+
+/**
+ * Lock the tray, or unlock it: PREVENT ALLOW MEDIUM REMOVAL. Locked, the
+ * eject button only produces LASER_MEDIA_EJECT_REQUEST.
+ *
+ * The lock is the drive's, not the token's: it outlives the registration,
+ * and must be lifted by whoever set it, on every path.
+ */
+laser_status_t laser_media_lock(int token, int locked);
+
+/**
+ * Open the tray: START STOP UNIT with LoEj, without waiting for it to open.
+ * Refused while the tray is locked.
+ */
+laser_status_t laser_media_eject(int token);
+
+/* ============================================================================
  * Classifying a result
  * ========================================================================= */
 

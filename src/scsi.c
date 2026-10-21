@@ -1608,3 +1608,176 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
     return read_chunked(token, lba, num_blocks, block_size, 12,
                         build_read_cd_cdb, &ctx, buffer, "sectors");
 }
+
+/* ============================================================================
+ * The medium: events, tray lock, eject - see laser.h
+ * ========================================================================= */
+
+/* GET EVENT STATUS NOTIFICATION, media class: the event codes in the low
+ * nibble of the descriptor's first byte, the status bits in its second. */
+#define GESN_CLASS_MEDIA            4
+#define GESN_MEDIA_EJECT_REQUEST    1
+#define GESN_MEDIA_NEW              2
+#define GESN_MEDIA_REMOVAL          3
+#define GESN_MEDIA_CHANGED          4
+#define GESN_MEDIA_STATUS_TRAY_OPEN 0x01
+
+/* One GET EVENT STATUS NOTIFICATION, polled, media class. Returns LASER_OK
+ * and fills @p out, LASER_ERR_REFUSED when the drive has no media events to
+ * give - the command refused, or answered without the class - or the status
+ * of a failure of the transport. */
+static laser_status_t media_events(int token, laser_media_status_t *out)
+{
+    uint8_t cdb[10] = { 0 };
+    cdb[0] = 0x4a; /* GET EVENT STATUS NOTIFICATION */
+    cdb[1] = 0x01; /* Polled */
+    cdb[4] = 1 << GESN_CLASS_MEDIA;
+    cdb[8] = 0x08; /* header + media event descriptor */
+
+    uint8_t buf[8] = { 0 };
+    int actual_len = 0;
+    laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb), buf,
+                                       sizeof(buf), 1, &actual_len);
+    if (st != LASER_OK)
+        return st;
+
+    /* NEA: no event of a class asked for is supported. */
+    if (actual_len < 8 || (buf[2] & 0x80) != 0 ||
+        (buf[2] & 0x07) != GESN_CLASS_MEDIA)
+        return LASER_ERR_REFUSED;
+
+    switch (buf[4] & 0x0f) {
+    case GESN_MEDIA_EJECT_REQUEST:
+        out->event = LASER_MEDIA_EJECT_REQUEST;
+        break;
+    case GESN_MEDIA_NEW:
+    case GESN_MEDIA_CHANGED:
+        out->event = LASER_MEDIA_NEW;
+        break;
+    case GESN_MEDIA_REMOVAL:
+        out->event = LASER_MEDIA_REMOVED;
+        break;
+    default:
+        out->event = LASER_MEDIA_NO_EVENT;
+        break;
+    }
+    out->tray_open = (buf[5] & GESN_MEDIA_STATUS_TRAY_OPEN) != 0;
+    /* The "present" bit is not trusted: see laser_medium_t. */
+    out->medium = LASER_MEDIUM_UNKNOWN;
+
+    if (out->event != LASER_MEDIA_NO_EVENT)
+        LOGI("token=%d: media event %d (raw %02x %02x), tray %s", token,
+             (int)out->event, buf[4], buf[5],
+             out->tray_open ? "open" : "closed");
+    return LASER_OK;
+}
+
+/* The same, from TEST UNIT READY, for a drive without media events. Taken
+ * directly rather than through laser_scsi_cdb(), whose retries would wait
+ * out the very states reported here. */
+static laser_status_t media_from_unit_ready(laser_entry_t *entry,
+                                            laser_media_status_t *out)
+{
+    pthread_mutex_lock(&entry->io_lock);
+
+    int rc = test_unit_ready_locked(entry);
+    uint8_t sense_key = 0xff, asc = 0, ascq = 0;
+    if (rc != 0 && rc != BOT_FAIL_NO_DEVICE)
+        request_sense_locked(entry, &sense_key, &asc, &ascq);
+
+    pthread_mutex_unlock(&entry->io_lock);
+
+    if (rc == BOT_FAIL_NO_DEVICE) {
+        entry->device_gone = 1;
+        return LASER_ERR_NO_DEVICE;
+    }
+
+    if (rc == 0) {
+        out->medium = LASER_MEDIUM_PRESENT;
+    } else if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+               asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
+        out->medium = LASER_MEDIUM_ABSENT;
+        out->tray_open = ascq == SCSI_ASCQ_TRAY_OPEN;
+    } else if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+               asc == SCSI_ASC_BECOMING_READY) {
+        out->medium = LASER_MEDIUM_PRESENT;
+    } else if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
+               asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+               ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) {
+        out->event = LASER_MEDIA_NEW;
+    } else if (sense_key == 0xff) {
+        return LASER_ERR_IO;
+    }
+    return LASER_OK;
+}
+
+laser_status_t laser_media_poll(int token, laser_media_status_t *out)
+{
+    if (out == NULL) {
+        LOGE("token=%d: laser_media_poll: NULL status", token);
+        return LASER_ERR_INVALID;
+    }
+    memset(out, 0, sizeof(*out));
+
+    laser_entry_t *entry = laser_lookup(token);
+    if (entry == NULL)
+        return LASER_ERR_NO_SUCH_TOKEN;
+    if (laser_is_cancelled(entry))
+        return LASER_ERR_CANCELLED;
+    if (entry->device_gone)
+        return LASER_ERR_NO_DEVICE;
+
+    laser_status_t st = LASER_ERR_REFUSED;
+    if (!entry->media_events_unsupported) {
+        st = media_events(token, out);
+        if (st == LASER_ERR_REFUSED) {
+            LOGI("token=%d, usb %04x:%04x: no media events, following the "
+                 "medium with TEST UNIT READY", token, entry->vid, entry->pid);
+            entry->media_events_unsupported = 1;
+            memset(out, 0, sizeof(*out));
+        }
+    }
+    if (st == LASER_ERR_REFUSED)
+        st = media_from_unit_ready(entry, out);
+
+    /* A new medium: the registration's wait answered for the one before, or
+     * for an empty drive. Its "never became ready" would otherwise outlive
+     * it for as long as a consumer keeps the device registered, and turn the
+     * new disc away unprobed; lowered, the next laser_token_settle() waits
+     * for this one instead. */
+    if (st == LASER_OK && entry->not_ready &&
+        (out->event == LASER_MEDIA_NEW ||
+         out->medium == LASER_MEDIUM_PRESENT)) {
+        pthread_mutex_lock(&entry->io_lock);
+        entry->not_ready = 0;
+        pthread_mutex_unlock(&entry->io_lock);
+        LOGI("token=%d: new medium, readiness to be checked again", token);
+    }
+    return st;
+}
+
+laser_status_t laser_media_lock(int token, int locked)
+{
+    uint8_t cdb[6] = { 0 };
+    cdb[0] = 0x1e;              /* PREVENT ALLOW MEDIUM REMOVAL */
+    cdb[4] = locked ? 0x01 : 0x00;
+
+    laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb), NULL, 0, 0,
+                                       NULL);
+    LOGI("token=%d: tray %s -> %d", token, locked ? "lock" : "unlock",
+         (int)st);
+    return st;
+}
+
+laser_status_t laser_media_eject(int token)
+{
+    uint8_t cdb[6] = { 0 };
+    cdb[0] = 0x1b;  /* START STOP UNIT */
+    cdb[1] = 0x01;  /* IMMED: the tray takes seconds */
+    cdb[4] = 0x02;  /* LOEJ, START clear: eject */
+
+    laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb), NULL, 0, 0,
+                                       NULL);
+    LOGI("token=%d: eject -> %d", token, (int)st);
+    return st;
+}
