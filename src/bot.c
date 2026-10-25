@@ -29,6 +29,7 @@
  * to decide whether it may be replayed.
  *****************************************************************************/
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -100,6 +101,61 @@ _Static_assert(sizeof(bot_csw_t) == USB_BOT_CSW_SIZE,
 #define PROBE_CBW_PHASE_TIMEOUT_MS    500
 #define PROBE_DATA_PHASE_TIMEOUT_MS   700
 #define PROBE_CSW_PHASE_TIMEOUT_MS    500
+
+static void bot_clear_stall(laser_entry_t *entry, unsigned char endpoint);
+
+/* Draining the Bulk-In pipe after an overflow: reads of this size - a
+ * multiple of every wMaxPacketSize (64, 512, 1024), so no packet can overflow
+ * them - each with this timeout, until one brings nothing, and no more than
+ * this many in all: a device streaming without end must not hold the caller
+ * forever. */
+#define DRAIN_CHUNK         (64 * 1024)
+#define DRAIN_TIMEOUT_MS    100
+#define DRAIN_MAX_READS     256
+
+/* Reads and discards what the device has queued on the Bulk-In pipe; returns
+ * the number of bytes thrown away. */
+static long bot_drain_in(laser_entry_t *entry)
+{
+    unsigned char *buf = malloc(DRAIN_CHUNK);
+    if (buf == NULL) {
+        return 0;
+    }
+
+    long total = 0;
+    for (int i = 0; i < DRAIN_MAX_READS; i++) {
+        int transferred = 0;
+        int ret = libusb_bulk_transfer(entry->handle, entry->ep_in, buf,
+                                       DRAIN_CHUNK, &transferred,
+                                       DRAIN_TIMEOUT_MS);
+        total += transferred;
+        if (ret == LIBUSB_ERROR_PIPE) {
+            bot_clear_stall(entry, entry->ep_in);
+        }
+        if (transferred == 0 || ret == LIBUSB_ERROR_NO_DEVICE) {
+            break;
+        }
+    }
+    free(buf);
+    return total;
+}
+
+/* Reset Recovery after the device sent more than asked. Some drives keep
+ * what they had queued - the rest of a read interrupted when the previous
+ * owner of the device went away - through the Mass Storage Reset, and serve
+ * it to every command after: an INQUIRY overflowed on each of its attempts,
+ * until the drive was unplugged. The queued data is read off first, and
+ * whatever the reset still lets out after it. */
+static void bot_overflow_recovery(laser_entry_t *entry)
+{
+    long before = bot_drain_in(entry);
+    laser_mass_storage_reset(entry);
+    long after = bot_drain_in(entry);
+    if (before > 0 || after > 0) {
+        LOG_QUIRK(entry, "drained %ld bytes queued on Bulk-In before the "
+                         "Reset Recovery, %ld after", before, after);
+    }
+}
 
 static void bot_clear_stall(laser_entry_t *entry, unsigned char endpoint)
 {
@@ -242,7 +298,11 @@ int laser_bot_send_locked(laser_entry_t *entry,
             LOG_QUIRK(entry, "data phase failed after %d/%d bytes (%s): "
                              "performing Reset Recovery",
                       transferred, data_len, libusb_error_name(ret));
-            laser_mass_storage_reset(entry);
+            if (ret == LIBUSB_ERROR_OVERFLOW && data_in) {
+                bot_overflow_recovery(entry);
+            } else {
+                laser_mass_storage_reset(entry);
+            }
             return BOT_FAIL_PHASE_ERROR;
         }
         if (actual_len) {
@@ -291,7 +351,13 @@ int laser_bot_send_locked(laser_entry_t *entry,
         LOG_QUIRK(entry, "no valid CSW after retry (%s, %d/%d bytes): "
                          "performing Reset Recovery",
                   libusb_error_name(ret), transferred, USB_BOT_CSW_SIZE);
-        laser_mass_storage_reset(entry);
+        /* More than 13 bytes where the CSW should be: queued data, as in the
+         * data phase above. */
+        if (ret == LIBUSB_ERROR_OVERFLOW) {
+            bot_overflow_recovery(entry);
+        } else {
+            laser_mass_storage_reset(entry);
+        }
         return BOT_FAIL_PHASE_ERROR;
     }
 
