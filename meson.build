@@ -49,6 +49,7 @@ laser_inc = include_directories('.', 'src')
 # directions, but this is the one list to update.
 laser_public_symbols = [
     'laser_set_log_cb',
+    'laser_set_abort_cb',
     'laser_parse_token',
     'laser_acquire',
     'laser_release',

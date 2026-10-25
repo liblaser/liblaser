@@ -155,9 +155,10 @@ typedef enum {
     LASER_ERR_INVALID = -8,
 
     /** The last claim on this token was dropped while the operation was
-     * running (see laser_release()). Kept apart from LASER_ERR_IO, so that a
-     * consumer unwinding on purpose does not log its own teardown as I/O
-     * errors. */
+     * running (see laser_release()), or the calling thread's abort check
+     * asked to stop (see laser_set_abort_cb()). Kept apart from LASER_ERR_IO,
+     * so that a consumer unwinding on purpose does not log its own teardown
+     * as I/O errors. */
     LASER_ERR_CANCELLED = -9,
 
     /**
@@ -255,6 +256,34 @@ laser_status_t laser_acquire(int token);
  * a consumer outlived the device it was authenticating against.
  */
 void laser_release(int token);
+
+/**
+ * Asked by an operation in progress whether to give up.
+ *
+ * @param opaque the pointer given to laser_set_abort_cb()
+ * @return non-zero to give up
+ */
+typedef int (*laser_abort_cb_t)(void *opaque);
+
+/**
+ * Let the calling thread's consumer stop its own operations: from now on, on
+ * THIS THREAD ONLY, every operation checks @p cb at the checkpoints where it
+ * checks the token's cancellation - before queueing for the drive, between
+ * retry attempts, on every round of the wait for a drive becoming ready,
+ * between the chunks of a block read - and gives up with LASER_ERR_CANCELLED
+ * when it returns non-zero. Passing NULL removes it.
+ *
+ * Unlike the cancellation laser_release() causes, it concerns no one else: the
+ * token, and the operations other consumers run on it, carry on.
+ *
+ * A transaction already on the wire is not cut short: it completes, or times
+ * out, first - which leaves the transport in a known state. So an abort takes
+ * effect within one retry delay (500 ms) or one transaction.
+ *
+ * @p cb is called from the operation's thread, possibly often: it must be
+ * cheap, and must not call into this library.
+ */
+void laser_set_abort_cb(laser_abort_cb_t cb, void *opaque);
 
 /**
  * Whether the drive behind @p token ended its readiness wait without ever

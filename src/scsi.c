@@ -186,6 +186,26 @@ static int test_unit_ready_locked(laser_entry_t *entry)
                                    NULL, 0, 0, NULL, &csw_status);
 }
 
+/* The calling thread's abort check (laser_set_abort_cb()). Per thread, so
+ * that one consumer giving up stops only its own operations, never those of
+ * the other consumers of the token. */
+static _Thread_local laser_abort_cb_t abort_cb;
+static _Thread_local void *abort_opaque;
+
+void laser_set_abort_cb(laser_abort_cb_t cb, void *opaque)
+{
+    abort_cb = cb;
+    abort_opaque = opaque;
+}
+
+/* Whether the operation in progress on this thread must give up: the token
+ * was cancelled, or this thread's consumer asked to stop. */
+static int laser_must_stop(const laser_entry_t *entry)
+{
+    return laser_is_cancelled(entry) ||
+           (abort_cb != NULL && abort_cb(abort_opaque));
+}
+
 /* Milliseconds elapsed since *start on CLOCK_MONOTONIC, so that a budget is
  * not stretched or cut by the system clock being stepped, which Android does
  * routinely after a boot or a network change. */
@@ -892,7 +912,7 @@ laser_status_t laser_scsi_cdb(int token,
 
     /* Before queueing on io_lock, so that a command arriving during teardown
      * does not first wait out the transaction in progress. */
-    if (laser_is_cancelled(entry)) {
+    if (laser_must_stop(entry)) {
         return LASER_ERR_CANCELLED;
     }
 
@@ -939,8 +959,9 @@ laser_status_t laser_scsi_cdb(int token,
 
         /* Cancellation is honoured between attempts: a transfer already
          * handed to the kernel runs to its timeout, but no further attempt
-         * follows. */
-        if (laser_is_cancelled(entry)) {
+         * follows. So is an abort, the "becoming ready" wait included: each
+         * of its rounds is an attempt. */
+        if (laser_must_stop(entry)) {
             LOGI("token=%d: cancelled, abandoning cdb 0x%02x after %d "
                  "attempt(s)", token, cdb[0], attempt - 1);
             result = LASER_ERR_CANCELLED;
