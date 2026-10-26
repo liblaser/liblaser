@@ -154,6 +154,7 @@ static bool udf_zone_present(udfread *udf, const char *path, const char *magic)
 #define BDMT_DIR      "/BDMV/META/DL"
 #define BDMT_NAME_LEN 12            /* "bdmt_" + 3-letter code + ".xml" */
 #define BDMT_MAX_SIZE (64 * 1024)   /* bound on the bytes read from one file */
+#define BDMT_MAX_FILES 32           /* bound on the languages tried */
 
 /** Rank of a directory entry as a title source, lower is better: the index
  * of its code in @p langs, then "eng", then any other language. -1 for a
@@ -175,32 +176,61 @@ static int bdmt_rank(const char *name, const char *const *langs)
     return strncasecmp(code, "eng", 3) == 0 ? i : i + 1;
 }
 
-/** Path of the best-ranked bdmt file into @p path, false if there is none. */
-static bool bdmt_pick(udfread *udf, const char *const *langs, char *path,
-                      size_t path_size)
+typedef struct
+{
+    char name[BDMT_NAME_LEN + 1];
+    int rank;
+} bdmt_file_t;
+
+/** The bdmt files into @p files, best-ranked first; their number, 0 if there
+ * is none. */
+static int bdmt_list(udfread *udf, const char *const *langs,
+                     bdmt_file_t files[BDMT_MAX_FILES])
 {
     UDFDIR *dir = udfread_opendir(udf, BDMT_DIR);
     if (dir == NULL)
-        return false;
+        return 0;
 
-    int best = INT_MAX;
+    int count = 0;
     struct udfread_dirent ent;
 
-    while (udfread_readdir(dir, &ent) != NULL)
+    while (count < BDMT_MAX_FILES && udfread_readdir(dir, &ent) != NULL)
     {
         if (ent.d_type == UDF_DT_DIR)
             continue;
 
         int rank = bdmt_rank(ent.d_name, langs);
-        if (rank >= 0 && rank < best)
+        if (rank < 0)
+            continue;
+
+        /* Inserted in rank order, after the files of the same rank. */
+        int i = count++;
+        while (i > 0 && files[i - 1].rank > rank)
         {
-            best = rank;
-            snprintf(path, path_size, BDMT_DIR "/%s", ent.d_name);
+            files[i] = files[i - 1];
+            i--;
         }
+        memcpy(files[i].name, ent.d_name, BDMT_NAME_LEN + 1);
+        files[i].rank = rank;
     }
 
     udfread_closedir(dir);
-    return best != INT_MAX;
+    return count;
+}
+
+/** Is @p name a placeholder rather than a title: what some discs put in the
+ * metadata of a language they were not authored for ("Blu-ray")? */
+static bool bdmt_title_is_placeholder(const char *name)
+{
+    static const char *const placeholders[] = {
+        "blu-ray", "blu-ray disc", "bluray", "blu ray", "bd", "bd-rom",
+        "bdmv", "disc", "title", "untitled",
+    };
+
+    for (size_t i = 0; i < sizeof(placeholders) / sizeof(placeholders[0]); i++)
+        if (strcasecmp(name, placeholders[i]) == 0)
+            return true;
+    return false;
 }
 
 /** Is [p, p + len) the tag name @p local, whatever its namespace prefix? */
@@ -408,25 +438,16 @@ static char *bdmt_find_name(char *xml)
     return NULL;
 }
 
-/** Read the BD-Video title into @p title (LASER_DISC_TITLE_MAX bytes), left
- * empty when the disc has no usable metadata - the caller falls back to the
- * volume label. */
-static void bdmt_read_title(udfread *udf, int token, const char *const *langs,
-                            char *title)
+/** The title in the bdmt file at @p path into @p title (LASER_DISC_TITLE_MAX
+ * bytes); false, @p title untouched, when it has none worth showing. */
+static bool bdmt_read_file(udfread *udf, int token, const char *path,
+                           char *title)
 {
-    char path[sizeof(BDMT_DIR) + BDMT_NAME_LEN + 1];
-
-    if (!bdmt_pick(udf, langs, path, sizeof(path)))
-    {
-        LOGI("token=%d: no disc library metadata in %s", token, BDMT_DIR);
-        return;
-    }
-
     UDFFILE *f = udfread_file_open(udf, path);
     if (f == NULL)
     {
         LOGI("token=%d: %s: cannot open", token, path);
-        return;
+        return false;
     }
 
     int64_t size = udfread_file_size(f);
@@ -443,21 +464,51 @@ static void bdmt_read_title(udfread *udf, int token, const char *const *langs,
     {
         LOGI("token=%d: %s: cannot read", token, path);
         free(xml);
-        return;
+        return false;
     }
     xml[got] = '\0';
 
+    bool found = false;
     const char *name = bdmt_find_name(xml);
     if (name == NULL || name[0] == '\0' ||
         !utf8_valid((const unsigned char *)name))
         LOGI("token=%d: %s: no usable title", token, path);
+    else if (bdmt_title_is_placeholder(name))
+        LOGI("token=%d: %s: placeholder title \"%s\", skipped", token, path,
+             name);
     else
     {
         copy_utf8(title, LASER_DISC_TITLE_MAX, name);
         LOGI("token=%d: %s: title \"%s\"", token, path, title);
+        found = true;
     }
 
     free(xml);
+    return found;
+}
+
+/** Read the BD-Video title into @p title (LASER_DISC_TITLE_MAX bytes): from
+ * the best-ranked language whose file has a real title, left empty when none
+ * has - the caller falls back to the volume label. */
+static void bdmt_read_title(udfread *udf, int token, const char *const *langs,
+                            char *title)
+{
+    bdmt_file_t files[BDMT_MAX_FILES];
+    int count = bdmt_list(udf, langs, files);
+
+    if (count == 0)
+    {
+        LOGI("token=%d: no disc library metadata in %s", token, BDMT_DIR);
+        return;
+    }
+
+    for (int i = 0; i < count; i++)
+    {
+        char path[sizeof(BDMT_DIR) + BDMT_NAME_LEN + 1];
+        snprintf(path, sizeof(path), BDMT_DIR "/%s", files[i].name);
+        if (bdmt_read_file(udf, token, path, title))
+            return;
+    }
 }
 
 /** Mounts the medium's UDF filesystem once and answers every UDF question
