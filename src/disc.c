@@ -1068,17 +1068,13 @@ void laser_disc_identify_lang(int token, const char *const *langs,
      * LASER_DISC_UNKNOWN and an empty label. */
     memset(out, 0, sizeof(*out));
 
-    /* A drive whose readiness wait ran out would answer every probe below
-     * the same way, each after a full retry budget. Checked before settling
-     * too, so that a drive that just failed its wait at registration is not
-     * made to fail it a second time. */
-    if (laser_token_not_ready(token)) {
-        LOGI("token=%d: drive never became ready, not probing the disc", token);
-        return;
-    }
-
-    /* The disc may have been swapped since the device was registered. */
+    /* The disc may have been swapped since the device was registered. A
+     * drive whose readiness wait already ran out is only checked once more,
+     * not waited for again: ready now, it is probed. */
     laser_token_settle(token);
+
+    /* A drive still not ready would answer every probe below the same way,
+     * each after a full retry budget. */
     if (laser_token_not_ready(token)) {
         LOGI("token=%d: drive did not become ready, not probing the disc",
              token);

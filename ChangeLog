@@ -1,3 +1,9 @@
+2026-10-28: version 0.3
+    - Report Blu-ray title from the disc's library metadata
+    - Report medium events and add capacity to lock or eject the tray
+    - Add a per-thread abort check
+    - Bug fixes
+
 2026-10-06: Version 0.2.1
     - Switch to meson build system
     - Add laser_parse_token helper function to extract the FD off a MRL

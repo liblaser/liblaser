@@ -654,7 +654,11 @@ void laser_wait_until_ready(laser_entry_t *entry)
 
 /* See laser_internal.h. The sense of a failed TEST UNIT READY is left for
  * the wait, whose first command replaces it: what matters is that the drive
- * is not ready, not why. */
+ * is not ready, not why.
+ *
+ * A drive whose wait already ran out ("never became ready") is checked once
+ * more but not waited for again: ready now, its flag is lowered; still not
+ * ready, it keeps it - a new medium lowers it too (laser_media_poll()). */
 void laser_token_settle(int token)
 {
     laser_entry_t *entry = laser_lookup(token);
@@ -663,9 +667,14 @@ void laser_token_settle(int token)
 
     pthread_mutex_lock(&entry->io_lock);
     int rc = test_unit_ready_locked(entry);
+    const int was_not_ready = entry->not_ready;
+    if (rc == 0)
+        entry->not_ready = 0;
     pthread_mutex_unlock(&entry->io_lock);
 
-    if (rc == 0 || rc == BOT_FAIL_NO_DEVICE)
+    if (rc == 0 && was_not_ready)
+        LOGI("token=%d: drive ready now, after its wait ran out", token);
+    if (rc == 0 || rc == BOT_FAIL_NO_DEVICE || was_not_ready)
         return;
 
     LOGI("token=%d: registered drive not ready - disc changed or still "
