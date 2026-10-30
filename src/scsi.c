@@ -31,6 +31,7 @@
  * reimplementing it.
  *****************************************************************************/
 
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -53,6 +54,10 @@
  * end, a scrambled sector before authentication. */
 #define SCSI_SENSE_KEY_ILLEGAL_REQUEST  0x05
 #define SCSI_SENSE_KEY_DATA_PROTECT     0x07
+
+/* A sector the drive could not read, its own retries and error correction
+ * spent: see LASER_READ_MAX_MEDIUM_ERRORS. */
+#define SCSI_SENSE_KEY_MEDIUM_ERROR     0x03
 
 /* Under ILLEGAL REQUEST, read after a refused START STOP UNIT: "no such
  * opcode" and "not in this shape" call for opposite next steps. */
@@ -108,6 +113,52 @@
  * enough for interactive playback. */
 #define LASER_MAX_RETRIES       6
 #define LASER_RETRY_DELAY_MS    500
+
+/* A read the drive did not answer at all, twice in a row - each time ending
+ * in a Reset Recovery, some five seconds - is not retried further: a drive
+ * stuck on a sector, as some are on a scrambled one read without CSS
+ * authentication, does no better the next four times, and the full budget
+ * turned one sector into half a minute. */
+#define LASER_READ_MAX_RESETS   2
+
+/* A read the drive answered with a medium error is tried twice, not
+ * LASER_MAX_RETRIES times: the drive has already retried the sector itself,
+ * and a disc it reads poorly - read fine by another drive - fails one
+ * attempt in several. A JMicron bridge stalls three seconds on each, and
+ * the full budget made a few such sectors outlast classification's minute. */
+#define LASER_READ_MAX_MEDIUM_ERRORS 2
+
+/* For a read - READ(10), READ(12), READ CD - its first block and block count,
+ * for the log: which sectors failed tells which file, and so which consumer,
+ * was reading. Writes " lba N x M" into [buf], or an empty string for any
+ * other command. Returns whether the command is a read. */
+static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size)
+{
+    buf[0] = '\0';
+    uint32_t count;
+    switch (cdb_len >= 10 ? cdb[0] : 0) {
+    case 0x28:  /* READ(10) */
+        count = (uint32_t)cdb[7] << 8 | cdb[8];
+        break;
+    case 0xa8:  /* READ(12) */
+        if (cdb_len < 12)
+            return 0;
+        count = (uint32_t)cdb[6] << 24 | (uint32_t)cdb[7] << 16 |
+                (uint32_t)cdb[8] << 8 | cdb[9];
+        break;
+    case 0xbe:  /* READ CD */
+        if (cdb_len < 12)
+            return 0;
+        count = (uint32_t)cdb[6] << 16 | (uint32_t)cdb[7] << 8 | cdb[8];
+        break;
+    default:
+        return 0;
+    }
+    const uint32_t lba = (uint32_t)cdb[2] << 24 | (uint32_t)cdb[3] << 16 |
+                         (uint32_t)cdb[4] << 8 | cdb[5];
+    snprintf(buf, size, " lba %u x %u", (unsigned)lba, (unsigned)count);
+    return 1;
+}
 
 /* Delay between two polls of the spin-up wait. */
 #define LASER_SPINUP_DELAY_MS      500
@@ -963,6 +1014,13 @@ laser_status_t laser_scsi_cdb(int token,
     int becoming_ready = 0;
     struct timespec becoming_ready_since;
 
+    /* Which sectors a read asks for, appended to its messages; and its
+     * Reset Recoveries in a row, see LASER_READ_MAX_RESETS. */
+    char where[40];
+    const int is_read = describe_read(cdb, cdb_len, where, sizeof(where));
+    int resets_in_a_row = 0;
+    int medium_errors = 0;
+
     for (int attempt = 1; attempt <= LASER_MAX_RETRIES; attempt++) {
         attempts_made = attempt;
 
@@ -990,9 +1048,9 @@ laser_status_t laser_scsi_cdb(int token,
              * through its budget on every command looks, in the log, like
              * one answering at once. */
             if (attempt > 1) {
-                LOGW("token=%d: cdb 0x%02x succeeded on attempt %d/%d - "
+                LOGW("token=%d: cdb 0x%02x%s succeeded on attempt %d/%d - "
                      "earlier attempts failed and were retried",
-                     token, cdb[0], attempt, LASER_MAX_RETRIES);
+                     token, cdb[0], where, attempt, LASER_MAX_RETRIES);
             }
             sample_throughput_locked(entry, data_len, &xfer_started);
             result = LASER_OK;
@@ -1018,14 +1076,25 @@ laser_status_t laser_scsi_cdb(int token,
         if (rc == BOT_FAIL_PHASE_ERROR) {
             /* The device was just reset: there is no completed command left
              * for REQUEST SENSE to explain. The attempt still counts. */
-            LOGW("token=%d: cdb 0x%02x ended in a Reset Recovery (attempt "
-                 "%d/%d)", token, cdb[0], attempt, LASER_MAX_RETRIES);
+            LOGW("token=%d: cdb 0x%02x%s ended in a Reset Recovery (attempt "
+                 "%d/%d)", token, cdb[0], where, attempt, LASER_MAX_RETRIES);
+            if (is_read && ++resets_in_a_row >= LASER_READ_MAX_RESETS) {
+                LOGW("token=%d: cdb 0x%02x%s - the drive did not answer %d "
+                     "times in a row, giving up on this read",
+                     token, cdb[0], where, resets_in_a_row);
+                reason_logged = 1;
+                result = LASER_ERR_IO;
+                break;
+            }
         } else if (csw_status == USB_BOT_STATUS_FAIL) {
             request_sense_locked(entry, &sense_key, &asc, &ascq);
             last_sense_key = sense_key;
             last_asc = asc;
             last_ascq = ascq;
         }
+
+        if (rc != BOT_FAIL_PHASE_ERROR)
+            resets_in_a_row = 0;
 
         /* Disc gone or swapped: never retried, so that an ejection is felt at
          * once. Every 3Ah qualifier, unlike in the spin-up wait: that wait
@@ -1065,9 +1134,9 @@ laser_status_t laser_scsi_cdb(int token,
             asc == SCSI_ASC_COPY_PROTECTION) {
             switch (ascq) {
             case SCSI_ASCQ_CP_SCRAMBLED:
-                LOGW("token=%d: cdb 0x%02x refused, scrambled sector without "
+                LOGW("token=%d: cdb 0x%02x%s refused, scrambled sector without "
                      "authentication (sense %02x/%02x/%02x)",
-                     token, cdb[0], sense_key, asc, ascq);
+                     token, cdb[0], where, sense_key, asc, ascq);
                 result = LASER_ERR_SCRAMBLED;
                 break;
             case SCSI_ASCQ_CP_AUTH_FAILURE:
@@ -1104,11 +1173,22 @@ laser_status_t laser_scsi_cdb(int token,
          * into what a user experiences as a hang. */
         if (sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST ||
             sense_key == SCSI_SENSE_KEY_DATA_PROTECT) {
-            LOGW("token=%d: cdb 0x%02x permanently refused "
+            LOGW("token=%d: cdb 0x%02x%s permanently refused "
                  "(sense %02x/%02x/%02x), not retrying",
-                 token, cdb[0], sense_key, asc, ascq);
+                 token, cdb[0], where, sense_key, asc, ascq);
             reason_logged = 1;
             result = LASER_ERR_REFUSED;
+            break;
+        }
+
+        /* An unreadable sector: see LASER_READ_MAX_MEDIUM_ERRORS. */
+        if (is_read && sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR &&
+            ++medium_errors >= LASER_READ_MAX_MEDIUM_ERRORS) {
+            LOGW("token=%d: cdb 0x%02x%s unreadable %d times "
+                 "(sense %02x/%02x/%02x), giving up on this read",
+                 token, cdb[0], where, medium_errors, sense_key, asc, ascq);
+            reason_logged = 1;
+            result = LASER_ERR_IO;
             break;
         }
 
@@ -1203,9 +1283,9 @@ laser_status_t laser_scsi_cdb(int token,
         result != LASER_ERR_CANCELLED) {
         /* The non-idempotent path has logged its own reason. */
         if (idempotent && !reason_logged) {
-            LOGW("token=%d: cdb 0x%02x failed after %d attempt(s) "
+            LOGW("token=%d: cdb 0x%02x%s failed after %d attempt(s) "
                  "(last sense %02x/%02x/%02x)",
-                 token, cdb[0], attempts_made,
+                 token, cdb[0], where, attempts_made,
                  last_sense_key, last_asc, last_ascq);
         }
         result = LASER_ERR_IO;
