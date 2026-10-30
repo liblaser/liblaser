@@ -189,6 +189,13 @@ static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size
  * comes first ends the wait. */
 #define LASER_NO_MEDIUM_MAX_WALL_MS 4000
 
+/* Once the drive has said it is becoming ready, a 3Ah answer no longer ends
+ * the wait at LASER_NO_MEDIUM_MAX_WALL_MS: the drive is loading a disc, and
+ * a 152d:0583 bridge's drive was seen answering 04h/01h for a second, then
+ * 3Ah/01h, while still loading one just inserted. Polled this long after its
+ * last "becoming ready", within LASER_BECOMING_READY_MAX_WALL_MS. */
+#define LASER_NO_MEDIUM_AFTER_LOADING_MS 10000
+
 /* GET MAX LUN: Bulk-Only class request, Device-to-Host, returning one byte,
  * the number of the LAST logical unit (0 means one unit). A device with a
  * single unit may stall it. */
@@ -589,8 +596,9 @@ void laser_wait_until_ready(laser_entry_t *entry)
     entry->not_ready = 1;
 
     /* Whether the drive said it was spinning up, for the device-gone report
-     * below. */
+     * below and the no-medium ceiling, and when it last said so. */
     int becoming_ready = 0;
+    struct timespec becoming_ready_last = started;
     int unit_attentions = 0;
 
     /* Bounded by the ceilings alone: every path below either returns, sleeps
@@ -636,6 +644,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
             asc == SCSI_ASC_BECOMING_READY) {
             becoming_ready = 1;
+            clock_gettime(CLOCK_MONOTONIC, &becoming_ready_last);
         }
 
         if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
@@ -650,9 +659,14 @@ void laser_wait_until_ready(laser_entry_t *entry)
 
             /* Tray closed, or no qualifier: an empty tray and a parked drive
              * holding a disc alike. Keep polling; the shorter ceiling bounds
-             * the empty case. */
+             * the empty case - unless the drive was loading a disc, see
+             * LASER_NO_MEDIUM_AFTER_LOADING_MS. */
             long no_medium_ms = monotonic_ms_since(&no_medium_since);
-            if (no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS) {
+            const int loading = becoming_ready &&
+                monotonic_ms_since(&becoming_ready_last) <
+                    LASER_NO_MEDIUM_AFTER_LOADING_MS &&
+                monotonic_ms_since(&started) < LASER_BECOMING_READY_MAX_WALL_MS;
+            if (no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS && !loading) {
                 LOGW("token=%d: still no medium %ldms after START STOP UNIT "
                      "(attempt %d), giving up wait",
                      entry->token, no_medium_ms, attempt);
@@ -661,10 +675,17 @@ void laser_wait_until_ready(laser_entry_t *entry)
                 return;
             }
 
-            LOGI("token=%d: no medium yet, waiting %dms (attempt %d, "
-                 "%ldms of %dms since START STOP UNIT)",
-                 entry->token, LASER_SPINUP_DELAY_MS, attempt,
-                 no_medium_ms, LASER_NO_MEDIUM_MAX_WALL_MS);
+            if (loading && no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS)
+                LOGI("token=%d: no medium yet, waiting %dms (attempt %d, "
+                     "%ldms since the drive said it was loading, up to %dms)",
+                     entry->token, LASER_SPINUP_DELAY_MS, attempt,
+                     monotonic_ms_since(&becoming_ready_last),
+                     LASER_NO_MEDIUM_AFTER_LOADING_MS);
+            else
+                LOGI("token=%d: no medium yet, waiting %dms (attempt %d, "
+                     "%ldms of %dms since START STOP UNIT)",
+                     entry->token, LASER_SPINUP_DELAY_MS, attempt,
+                     no_medium_ms, LASER_NO_MEDIUM_MAX_WALL_MS);
             usleep(LASER_SPINUP_DELAY_MS * 1000);
             continue;
         }
@@ -1432,6 +1453,21 @@ int laser_status_is_positional(int status)
 typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
                                   const void *ctx);
 
+/* Record that this device completed a @p bytes read in one command; see
+ * laser_entry_t::largest_ok_bytes. */
+static void raise_largest_ok(laser_entry_t *entry, int bytes)
+{
+    if (bytes <= entry->largest_ok_bytes) {
+        return;
+    }
+
+    pthread_mutex_lock(&entry->io_lock);
+    if (bytes > entry->largest_ok_bytes) {
+        entry->largest_ok_bytes = bytes;
+    }
+    pthread_mutex_unlock(&entry->io_lock);
+}
+
 /* Lower this device's transfer cap to @p bytes, if it is above that. Called
  * once smaller transfers have read the whole range a @p failed_bytes one
  * failed on. */
@@ -1558,10 +1594,12 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
 
             /* Maybe the bridge rather than the disc: try the same blocks at
              * half the size. The first failure of a negotiation sets the
-             * range it must cover. */
+             * range it must cover. Not when the device has already read
+             * this much in one command: then it is the disc. */
             const int tried = chunk * block_size;
             if (st == LASER_ERR_IO && chunk > 1 && entry != NULL &&
-                tried > LASER_MIN_BYTES_PER_TRANSFER) {
+                tried > LASER_MIN_BYTES_PER_TRANSFER &&
+                tried > entry->largest_ok_bytes) {
                 if (trial_cap == 0) {
                     trial_end = blocks_done + chunk;
                     trial_failed = tried;
@@ -1595,6 +1633,9 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
             return short_total;
         }
 
+        if (entry != NULL) {
+            raise_largest_ok(entry, chunk * block_size);
+        }
         blocks_done += chunk;
 
         if (trial_cap > 0 && blocks_done >= trial_end) {

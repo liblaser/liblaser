@@ -107,6 +107,15 @@ typedef struct {
      * read asks for too much once and fails over to the same negotiation. */
     int max_transfer_bytes;
 
+    /* Largest read, in bytes, this device has completed in one command: a
+     * failed transfer no larger than that cannot be the bridge's limit, and
+     * read_chunked() does not negotiate over it - the halved read would fail
+     * on the same sector, at the cost of a second round of timeouts.
+     *
+     * Starts at 0 (the slot is zeroed) and only ever grows. Written under
+     * io_lock, read without it: a stale read negotiates once for nothing. */
+    int largest_ok_bytes;
+
     /* Raised by the laser_release() that drops the last claim, just before
      * teardown, and never cleared; the slot is memset afterwards. An
      * operation still running on another thread sees it between retry
