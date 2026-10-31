@@ -343,16 +343,12 @@ static void sample_throughput_locked(laser_entry_t *entry, int data_len,
         return;
     }
 
-    LOGW("token=%d, usb %04x:%04x: sustained read throughput is only "
-         "%llu KiB/s - %llu KiB takes %llu ms per transfer, on a link whose "
-         "wMaxPacketSize of %u implies far more. NO COMMAND HAS FAILED: the "
-         "drive answers everything correctly, just slowly, and the retries "
-         "costing that time happen in the host controller and the drive's own "
-         "firmware, below anything this library can observe. THE USUAL CAUSE "
-         "IS INSUFFICIENT POWER: an underfed drive enumerates and answers "
-         "correctly while reading at a fraction of its rate. Try a powered "
-         "hub or a stronger supply. A DVD may survive this; a Blu-ray will "
-         "stutter.",
+    /* Kept under the log line limit (LOG_LINE_MAX in registry.c): the advice
+     * at its end is the point of it. */
+    LOGW("token=%d, usb %04x:%04x: read throughput only %llu KiB/s "
+         "(%llu KiB in %llu ms per transfer, wMaxPacketSize %u) with no "
+         "command failing - most likely an underpowered drive: try a powered "
+         "hub or a stronger supply",
          entry->token, entry->vid, entry->pid,
          (unsigned long long)kib_per_s, (unsigned long long)per_kib,
          (unsigned long long)per_ms, entry->ep_max_packet);
@@ -494,6 +490,14 @@ static void spin_up_locked(laser_entry_t *entry)
              "IMMED (this one may block for the whole spin-up)",
              entry->token);
         start_stop_unit_locked(entry, 0, 0x01, &sense_key, &asc, &ascq);
+        return;
+    }
+
+    /* The tray is open: LOEJ would close it on the user. The wait that
+     * follows sees the open tray and ends at once. */
+    if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+        asc == SCSI_ASC_MEDIUM_NOT_PRESENT && ascq == SCSI_ASCQ_TRAY_OPEN) {
+        LOGI("token=%d: tray open, not loading it", entry->token);
         return;
     }
 
@@ -1773,11 +1777,24 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
 #define GESN_MEDIA_CHANGED          4
 #define GESN_MEDIA_STATUS_TRAY_OPEN 0x01
 
-/* One GET EVENT STATUS NOTIFICATION, polled, media class. Returns LASER_OK
- * and fills @p out, LASER_ERR_REFUSED when the drive has no media events to
- * give - the command refused, or answered without the class - or the status
- * of a failure of the transport. */
-static laser_status_t media_events(int token, laser_media_status_t *out)
+/* One GET EVENT STATUS NOTIFICATION, polled, media class.
+ *
+ * A single attempt, taken directly rather than through laser_scsi_cdb(): a
+ * poll comes back every second or two, and the read retry policy - six
+ * attempts, each possibly ending in a Reset Recovery - held the drive for
+ * fifteen seconds and more on a failing one, the player's reads waiting
+ * behind it. A UNIT ATTENTION alone is asked again at once: reported, it is
+ * cleared, and costs nothing.
+ *
+ * Returns LASER_OK and fills @p out; LASER_ERR_REFUSED only when the drive
+ * says it has no media events - the command refused as ILLEGAL REQUEST, or
+ * answered with "no event class supported" - which turns them off for the
+ * token; LASER_ERR_NO_DEVICE; LASER_ERR_IO for anything else, a short or
+ * odd answer included: one of those from a bridge having a bad moment must
+ * not cost the token its media events, and with them the eject button of a
+ * locked tray, for good. */
+static laser_status_t media_events(laser_entry_t *entry,
+                                   laser_media_status_t *out)
 {
     uint8_t cdb[10] = { 0 };
     cdb[0] = 0x4a; /* GET EVENT STATUS NOTIFICATION */
@@ -1785,17 +1802,46 @@ static laser_status_t media_events(int token, laser_media_status_t *out)
     cdb[4] = 1 << GESN_CLASS_MEDIA;
     cdb[8] = 0x08; /* header + media event descriptor */
 
-    uint8_t buf[8] = { 0 };
+    uint8_t buf[8];
     int actual_len = 0;
-    laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb), buf,
-                                       sizeof(buf), 1, &actual_len);
-    if (st != LASER_OK)
-        return st;
+    int rc = -1, csw_status = -1;
+    uint8_t sense_key = 0xff, asc = 0, ascq = 0;
+
+    pthread_mutex_lock(&entry->io_lock);
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        memset(buf, 0, sizeof(buf));
+        actual_len = 0;
+        csw_status = -1;
+        sense_key = 0xff;
+        rc = laser_bot_send_locked(entry, cdb, sizeof(cdb), buf, sizeof(buf),
+                                   1, &actual_len, &csw_status);
+        if (rc == 0 || rc == BOT_FAIL_NO_DEVICE ||
+            csw_status != USB_BOT_STATUS_FAIL)
+            break;
+        request_sense_locked(entry, &sense_key, &asc, &ascq);
+        if (sense_key != SCSI_SENSE_KEY_UNIT_ATTENTION)
+            break;
+    }
+    pthread_mutex_unlock(&entry->io_lock);
+
+    if (rc == BOT_FAIL_NO_DEVICE) {
+        entry->device_gone = 1;
+        return LASER_ERR_NO_DEVICE;
+    }
+    if (rc != 0) {
+        if (sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST)
+            return LASER_ERR_REFUSED;
+        return LASER_ERR_IO;
+    }
+
+    if (actual_len < 8)
+        return LASER_ERR_IO;
 
     /* NEA: no event of a class asked for is supported. */
-    if (actual_len < 8 || (buf[2] & 0x80) != 0 ||
-        (buf[2] & 0x07) != GESN_CLASS_MEDIA)
+    if ((buf[2] & 0x80) != 0)
         return LASER_ERR_REFUSED;
+    if ((buf[2] & 0x07) != GESN_CLASS_MEDIA)
+        return LASER_ERR_IO;
 
     switch (buf[4] & 0x0f) {
     case GESN_MEDIA_EJECT_REQUEST:
@@ -1817,7 +1863,7 @@ static laser_status_t media_events(int token, laser_media_status_t *out)
     out->medium = LASER_MEDIUM_UNKNOWN;
 
     if (out->event != LASER_MEDIA_NO_EVENT)
-        LOGI("token=%d: media event %d (raw %02x %02x), tray %s", token,
+        LOGI("token=%d: media event %d (raw %02x %02x), tray %s", entry->token,
              (int)out->event, buf[4], buf[5],
              out->tray_open ? "open" : "closed");
     return LASER_OK;
@@ -1880,7 +1926,7 @@ laser_status_t laser_media_poll(int token, laser_media_status_t *out)
 
     laser_status_t st = LASER_ERR_REFUSED;
     if (!entry->media_events_unsupported) {
-        st = media_events(token, out);
+        st = media_events(entry, out);
         if (st == LASER_ERR_REFUSED) {
             LOGI("token=%d, usb %04x:%04x: no media events, following the "
                  "medium with TEST UNIT READY", token, entry->vid, entry->pid);
