@@ -50,9 +50,8 @@ extern "C" {
 #define LASER_DISC_TITLE_MAX 256
 
 typedef enum {
-    /** Not recognised: a data disc, an empty drive or a read failure alike,
-     * since no consumer acts differently on them. Should that change, the
-     * reason belongs in a separate out-parameter, not in this enum. */
+    /** Not recognised: a data disc, an empty drive or a read failure alike.
+     * laser_disc_t::state says which of these it is. */
     LASER_DISC_UNKNOWN = 0,
 
     LASER_DISC_CD_AUDIO,
@@ -63,6 +62,28 @@ typedef enum {
     LASER_DISC_VCD,
     LASER_DISC_SVCD,
 } laser_disc_kind_t;
+
+/** Whether there was a medium to identify, for a LASER_DISC_UNKNOWN answer:
+ * the user is told to insert a disc, to close the tray, or that the drive is
+ * not answering. */
+typedef enum {
+    /** The drive answered ready: a medium is in, and laser_disc_t::kind says
+     * what it is - LASER_DISC_UNKNOWN for a data disc, or one that could not
+     * be read. The value of every identified disc. */
+    LASER_DISC_STATE_PRESENT = 0,
+
+    /** No medium, tray closed: an empty drive - or one that could not read
+     * the disc it holds, which drives report the same way. */
+    LASER_DISC_STATE_NO_MEDIUM,
+
+    /** No medium, tray open. */
+    LASER_DISC_STATE_TRAY_OPEN,
+
+    /** The drive did not become ready, nor said why, within its wait: still
+     * spinning up, stuck, or underpowered. Also the answer without a claim
+     * on the token. */
+    LASER_DISC_STATE_NOT_READY,
+} laser_disc_state_t;
 
 typedef struct {
     laser_disc_kind_t kind;
@@ -88,6 +109,10 @@ typedef struct {
      * meant to be shown as it is. Empty for every other kind, and for a
      * Blu-ray without that metadata: callers fall back to volume_id. */
     char title[LASER_DISC_TITLE_MAX];
+
+    /** Whether there was a medium to identify: see laser_disc_state_t.
+     * LASER_DISC_STATE_PRESENT whenever kind is not LASER_DISC_UNKNOWN. */
+    laser_disc_state_t state;
 } laser_disc_t;
 
 /**
@@ -104,7 +129,7 @@ typedef struct {
  *
  * BEST EFFORT, AND NEVER FATAL. @p out is always filled: an unreadable or
  * unrecognised disc yields LASER_DISC_UNKNOWN and an empty volume_id and
- * title, the same answer as an empty drive.
+ * title, like an empty drive; laser_disc_t::state tells them apart.
  *
  * Detection order, each step skipped once an earlier one has answered:
  *

@@ -1012,6 +1012,18 @@ static const char *laser_disc_kind_name(laser_disc_kind_t kind)
     return "unknown";
 }
 
+static const char *laser_disc_state_name(laser_disc_state_t state)
+{
+    switch (state)
+    {
+        case LASER_DISC_STATE_PRESENT:   return "medium present";
+        case LASER_DISC_STATE_NO_MEDIUM: return "no medium";
+        case LASER_DISC_STATE_TRAY_OPEN: return "tray open";
+        case LASER_DISC_STATE_NOT_READY: break;
+    }
+    return "no answer";
+}
+
 /* Each detector writes out->volume_id only when it recognises something, so
  * a miss leaves the empty label for the next one. */
 static bool identify_udf(int token, const char *const *langs,
@@ -1074,10 +1086,23 @@ void laser_disc_identify_lang(int token, const char *const *langs,
     laser_token_settle(token);
 
     /* A drive still not ready would answer every probe below the same way,
-     * each after a full retry budget. */
-    if (laser_token_not_ready(token)) {
-        LOGI("token=%d: drive did not become ready, not probing the disc",
-             token);
+     * each after a full retry budget. Why it is not ready - no medium, the
+     * tray open, or no answer - is what its wait last found. */
+    laser_entry_t *entry = laser_lookup(token);
+    if (entry == NULL || laser_token_not_ready(token)) {
+        switch (entry != NULL ? entry->wait_state : LASER_WAIT_NOT_READY) {
+            case LASER_WAIT_NO_MEDIUM:
+                out->state = LASER_DISC_STATE_NO_MEDIUM;
+                break;
+            case LASER_WAIT_TRAY_OPEN:
+                out->state = LASER_DISC_STATE_TRAY_OPEN;
+                break;
+            default:
+                out->state = LASER_DISC_STATE_NOT_READY;
+                break;
+        }
+        LOGI("token=%d: drive did not become ready (%s), not probing the disc",
+             token, laser_disc_state_name(out->state));
         return;
     }
 

@@ -128,11 +128,15 @@
  * the full budget made a few such sectors outlast classification's minute. */
 #define LASER_READ_MAX_MEDIUM_ERRORS 2
 
-/* For a read - READ(10), READ(12), READ CD - its first block and block count,
- * for the log: which sectors failed tells which file, and so which consumer,
- * was reading. Writes " lba N x M" into [buf], or an empty string for any
- * other command. Returns whether the command is a read. */
-static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size)
+/* For a read - READ(10), READ(12), READ CD - its first block and block count:
+ * for the log, since which sectors failed tells which file, and so which
+ * consumer, was reading; and for the throughput sample, which counts only
+ * reads following each other. Writes " lba N x M" into [buf], or an empty
+ * string for any other command, and the range into [*lba_out, *count_out],
+ * left untouched for any other command. Returns whether the command is a
+ * read. */
+static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size,
+                         uint32_t *lba_out, uint32_t *count_out)
 {
     buf[0] = '\0';
     uint32_t count;
@@ -157,6 +161,8 @@ static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size
     const uint32_t lba = (uint32_t)cdb[2] << 24 | (uint32_t)cdb[3] << 16 |
                          (uint32_t)cdb[4] << 8 | cdb[5];
     snprintf(buf, size, " lba %u x %u", (unsigned)lba, (unsigned)count);
+    *lba_out = lba;
+    *count_out = count;
     return 1;
 }
 
@@ -244,6 +250,21 @@ static int test_unit_ready_locked(laser_entry_t *entry)
                                    NULL, 0, 0, NULL, &csw_status);
 }
 
+/* Sleeps @p ms with io_lock released, then takes it again: for the delays
+ * between the attempts of a command, and the rounds of a wait, so that the
+ * other consumers of the drive - a poll, the player, libdvdcss - are not held
+ * up for the whole of a retry budget, or of a thirty-second wait for a drive
+ * becoming ready. Whatever the caller knew of the drive's state may have
+ * changed by the time it returns.
+ *
+ * Caller MUST hold entry->io_lock; holds it again on return. */
+static void sleep_unlocked(laser_entry_t *entry, int ms)
+{
+    pthread_mutex_unlock(&entry->io_lock);
+    usleep((useconds_t)ms * 1000);
+    pthread_mutex_lock(&entry->io_lock);
+}
+
 /* The calling thread's abort check (laser_set_abort_cb()). Per thread, so
  * that one consumer giving up stops only its own operations, never those of
  * the other consumers of the token. */
@@ -276,7 +297,8 @@ static long monotonic_ms_since(const struct timespec *start)
 }
 
 /* Only transfers at least this large are sampled: smaller ones measure
- * command latency, not the link. */
+ * command latency, not the link. And only reads continuing the previous one:
+ * see the caller. */
 #define LASER_XFER_SAMPLE_MIN_BYTES  (32 * 1024)
 
 /* Bytes sampled before the average is believed: one slow transfer - a seek,
@@ -559,6 +581,14 @@ static void log_media_status_locked(laser_entry_t *entry)
          no_event, class, buf[2], buf[3], buf[4], buf[5]);
 }
 
+/* How a readiness wait ended - see laser_entry_t::wait_state. Caller MUST
+ * hold entry->io_lock. */
+static void wait_end_locked(laser_entry_t *entry, int state)
+{
+    entry->wait_state = state;
+    entry->not_ready = state != LASER_WAIT_READY;
+}
+
 /* Wake the drive and wait for its medium to become ready - see the contract
  * in laser_internal.h.
  *
@@ -596,7 +626,8 @@ void laser_wait_until_ready(laser_entry_t *entry)
     clock_gettime(CLOCK_MONOTONIC, &no_medium_since);
 
     /* Lowered only by the ready return below, so that every other way out of
-     * the loop leaves it raised. */
+     * the loop leaves it raised - set again by wait_end_locked(), since a poll
+     * may lower it while the wait sleeps. */
     entry->not_ready = 1;
 
     /* Whether the drive said it was spinning up, for the device-gone report
@@ -614,7 +645,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
         if (rc == 0) {
             LOGI("token=%d: unit ready (attempt %d, %ldms)",
                  entry->token, attempt, monotonic_ms_since(&started));
-            entry->not_ready = 0;
+            wait_end_locked(entry, LASER_WAIT_READY);
             pthread_mutex_unlock(&entry->io_lock);
             return;
         }
@@ -633,6 +664,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
                      entry->token, monotonic_ms_since(&started));
             }
 
+            wait_end_locked(entry, LASER_WAIT_NOT_READY);
             pthread_mutex_unlock(&entry->io_lock);
             return;
         }
@@ -657,6 +689,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
                 LOGW("token=%d: tray open (attempt %d), giving up wait",
                      entry->token, attempt);
                 log_media_status_locked(entry);
+                wait_end_locked(entry, LASER_WAIT_TRAY_OPEN);
                 pthread_mutex_unlock(&entry->io_lock);
                 return;
             }
@@ -675,6 +708,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
                      "(attempt %d), giving up wait",
                      entry->token, no_medium_ms, attempt);
                 log_media_status_locked(entry);
+                wait_end_locked(entry, LASER_WAIT_NO_MEDIUM);
                 pthread_mutex_unlock(&entry->io_lock);
                 return;
             }
@@ -690,7 +724,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
                      "%ldms of %dms since START STOP UNIT)",
                      entry->token, LASER_SPINUP_DELAY_MS, attempt,
                      no_medium_ms, LASER_NO_MEDIUM_MAX_WALL_MS);
-            usleep(LASER_SPINUP_DELAY_MS * 1000);
+            sleep_unlocked(entry, LASER_SPINUP_DELAY_MS);
             continue;
         }
 
@@ -720,11 +754,12 @@ void laser_wait_until_ready(laser_entry_t *entry)
         LOGI("token=%d: drive not ready, waiting %dms (attempt %d, %ldms "
              "of %ldms elapsed)",
              entry->token, LASER_SPINUP_DELAY_MS, attempt, elapsed, ceiling);
-        usleep(LASER_SPINUP_DELAY_MS * 1000);
+        sleep_unlocked(entry, LASER_SPINUP_DELAY_MS);
     }
 
     LOGW("token=%d: drive did not become ready after %ldms, proceeding anyway",
          entry->token, monotonic_ms_since(&started));
+    wait_end_locked(entry, LASER_WAIT_NOT_READY);
     pthread_mutex_unlock(&entry->io_lock);
 }
 
@@ -744,14 +779,32 @@ void laser_token_settle(int token)
     pthread_mutex_lock(&entry->io_lock);
     int rc = test_unit_ready_locked(entry);
     const int was_not_ready = entry->not_ready;
-    if (rc == 0)
-        entry->not_ready = 0;
+    int loading = 0;
+    if (rc == 0) {
+        wait_end_locked(entry, LASER_WAIT_READY);
+    } else if (rc != BOT_FAIL_NO_DEVICE && was_not_ready) {
+        /* Not waited for again, but the reason is brought up to date: the
+         * tray may have been opened, or closed on an empty drive, since. */
+        uint8_t sense_key = 0xff, asc = 0, ascq = 0;
+        request_sense_locked(entry, &sense_key, &asc, &ascq);
+        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+            asc == SCSI_ASC_MEDIUM_NOT_PRESENT)
+            wait_end_locked(entry, ascq == SCSI_ASCQ_TRAY_OPEN
+                                   ? LASER_WAIT_TRAY_OPEN
+                                   : LASER_WAIT_NO_MEDIUM);
+        else if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
+                 asc == SCSI_ASC_BECOMING_READY)
+            loading = 1;
+    }
     pthread_mutex_unlock(&entry->io_lock);
 
     if (rc == 0 && was_not_ready)
         LOGI("token=%d: drive ready now, after its wait ran out", token);
-    if (rc == 0 || rc == BOT_FAIL_NO_DEVICE || was_not_ready)
+    if (rc == 0 || rc == BOT_FAIL_NO_DEVICE || (was_not_ready && !loading))
         return;
+    if (loading)
+        LOGI("token=%d: drive loading a disc now, after its wait ran out",
+             token);
 
     LOGI("token=%d: registered drive not ready - disc changed or still "
          "loading, waiting for it", token);
@@ -938,6 +991,18 @@ static int request_sense_locked(laser_entry_t *entry,
  * primitive everything else goes through.
  * ============================================================================ */
 
+/* The delay before another attempt. An idempotent command lets the other
+ * consumers in meanwhile (sleep_unlocked()); a command changing CSS state
+ * keeps the drive, its sequence being the one thing io_lock must not let
+ * another command into. */
+static void retry_delay(laser_entry_t *entry, int idempotent)
+{
+    if (idempotent)
+        sleep_unlocked(entry, LASER_RETRY_DELAY_MS);
+    else
+        usleep(LASER_RETRY_DELAY_MS * 1000);
+}
+
 laser_status_t laser_scsi_cdb(int token,
                               const uint8_t *cdb, int cdb_len,
                               uint8_t *data, int data_len,
@@ -1042,7 +1107,9 @@ laser_status_t laser_scsi_cdb(int token,
     /* Which sectors a read asks for, appended to its messages; and its
      * Reset Recoveries in a row, see LASER_READ_MAX_RESETS. */
     char where[40];
-    const int is_read = describe_read(cdb, cdb_len, where, sizeof(where));
+    uint32_t read_lba = 0, read_count = 0;
+    const int is_read = describe_read(cdb, cdb_len, where, sizeof(where),
+                                      &read_lba, &read_count);
     int resets_in_a_row = 0;
     int medium_errors = 0;
 
@@ -1077,7 +1144,14 @@ laser_status_t laser_scsi_cdb(int token,
                      "earlier attempts failed and were retried",
                      token, cdb[0], where, attempt, LASER_MAX_RETRIES);
             }
-            sample_throughput_locked(entry, data_len, &xfer_started);
+            /* Only a read following the previous one is a sample: a seek
+             * costs what a slow link does, and a classification - the UDF
+             * walk, the IFOs - is mostly seeks. */
+            if (is_read) {
+                if (read_lba == entry->xfer_next_lba)
+                    sample_throughput_locked(entry, data_len, &xfer_started);
+                entry->xfer_next_lba = read_lba + read_count;
+            }
             result = LASER_OK;
             break;
         }
@@ -1143,7 +1217,7 @@ laser_status_t laser_scsi_cdb(int token,
                 LOGI("token=%d: drive now ready (06/28/00 after spin-up), "
                      "retrying cdb 0x%02x", token, cdb[0]);
                 becoming_ready = 0;
-                entry->not_ready = 0;
+                wait_end_locked(entry, LASER_WAIT_READY);
                 attempt--;
                 continue;
             }
@@ -1248,7 +1322,7 @@ laser_status_t laser_scsi_cdb(int token,
             if (monotonic_ms_since(&becoming_ready_since) <
                 LASER_BECOMING_READY_MAX_WALL_MS) {
                 attempt--;
-                usleep(LASER_RETRY_DELAY_MS * 1000);
+                retry_delay(entry, idempotent);
                 continue;
             }
         }
@@ -1270,7 +1344,7 @@ laser_status_t laser_scsi_cdb(int token,
         }
 
         if (attempt < LASER_MAX_RETRIES) {
-            usleep(LASER_RETRY_DELAY_MS * 1000);
+            retry_delay(entry, idempotent);
         }
     }
 
