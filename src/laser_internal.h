@@ -172,6 +172,9 @@ typedef struct {
     uint64_t xfer_us;
     uint64_t xfer_count;
     int      slow_warned;
+    /* The block after the last successful read: only a read starting there
+     * is sampled, a seek costing what a slow link does. Under io_lock. */
+    uint32_t xfer_next_lba;
 
     uint32_t tag;
 
@@ -231,6 +234,13 @@ typedef struct {
      * Registration succeeds either way; laser_disc_identify() reads it to
      * skip probes that would each spend a retry budget for nothing. */
     int             not_ready;
+
+    /* How the last readiness wait ended, a LASER_WAIT_* value: why a drive is
+     * not ready, for laser_disc_identify() to say so - an empty drive and one
+     * that never answered call for different answers in the user interface.
+     * Brought up to date by laser_token_settle() for a drive whose wait had
+     * already run out. Written under io_lock, read without it. */
+    int             wait_state;
 
     /* Set once the drive has failed to answer GET EVENT STATUS NOTIFICATION
      * for the media class: laser_media_poll() then asks TEST UNIT READY. Not
@@ -340,6 +350,20 @@ void laser_wait_until_ready(laser_entry_t *entry);
  * gone.
  */
 void laser_token_settle(int token);
+
+/** How a readiness wait ended: laser_entry_t::wait_state. */
+enum {
+    /** The unit answered ready. Also the value before any wait. */
+    LASER_WAIT_READY = 0,
+    /** MEDIUM NOT PRESENT, tray closed: an empty drive, or one that could
+     * not read the disc it holds. */
+    LASER_WAIT_NO_MEDIUM,
+    /** MEDIUM NOT PRESENT, tray open. */
+    LASER_WAIT_TRAY_OPEN,
+    /** Anything else: the drive never said ready, nor why not, before the
+     * ceiling - or it left the bus. */
+    LASER_WAIT_NOT_READY,
+};
 
 /** Answers of laser_probe_lun(). */
 enum {
