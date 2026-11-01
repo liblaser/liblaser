@@ -3,7 +3,6 @@
     - Bug fixes
 
 2026-10-28: version 0.3
-    - Report the reason why no disc was identified
     - Report Blu-ray title from the disc's library metadata
     - Report medium events and add capacity to lock or eject the tray
     - Add a per-thread abort check
