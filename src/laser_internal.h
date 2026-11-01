@@ -246,6 +246,12 @@ typedef struct {
      * for the media class: laser_media_poll() then asks TEST UNIT READY. Not
      * locked: a poll that reads it stale asks the 4Ah once more. */
     int             media_events_unsupported;
+
+    /* When a command last failed an attempt, on CLOCK_MONOTONIC in
+     * milliseconds; 0 if none has. A media poll leaves the drive alone for
+     * a while after it (see poll_lock() in scsi.c). Written and read under
+     * io_lock. */
+    int64_t         last_failure_ms;
 } laser_entry_t;
 
 /**

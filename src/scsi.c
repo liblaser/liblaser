@@ -114,6 +114,12 @@
 #define LASER_MAX_RETRIES       6
 #define LASER_RETRY_DELAY_MS    500
 
+/* How long after a failed attempt a media poll leaves the drive alone (see
+ * poll_lock()): past the retry delay, so that a poll never lands between
+ * two attempts, and past one poll interval of the application's, so that
+ * the next poll finds a drive that has had time to recover. */
+#define LASER_POLL_QUIET_MS     3000
+
 /* A read the drive did not answer at all, twice in a row - each time ending
  * in a Reset Recovery, some five seconds - is not retried further: a drive
  * stuck on a sector, as some are on a scrambled one read without CSS
@@ -294,6 +300,14 @@ static long monotonic_ms_since(const struct timespec *start)
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - start->tv_sec) * 1000L
            + (now.tv_nsec - start->tv_nsec) / 1000000L;
+}
+
+/* Now on CLOCK_MONOTONIC, in milliseconds - for a time kept in an entry. */
+static int64_t monotonic_ms_now(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
 /* Only transfers at least this large are sampled: smaller ones measure
@@ -997,6 +1011,9 @@ static int request_sense_locked(laser_entry_t *entry,
  * another command into. */
 static void retry_delay(laser_entry_t *entry, int idempotent)
 {
+    /* An attempt failed: polls stay away while the command retries. */
+    entry->last_failure_ms = monotonic_ms_now();
+
     if (idempotent)
         sleep_unlocked(entry, LASER_RETRY_DELAY_MS);
     else
@@ -1389,6 +1406,11 @@ laser_status_t laser_scsi_cdb(int token,
         }
         result = LASER_ERR_IO;
     }
+
+    /* The drive failed the command outright - not a refusal of one sector
+     * or key, answered at once: polls give it time to recover. */
+    if (result == LASER_ERR_IO)
+        entry->last_failure_ms = monotonic_ms_now();
 
     pthread_mutex_unlock(&entry->io_lock);
     return result;
@@ -1851,6 +1873,28 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
 #define GESN_MEDIA_CHANGED          4
 #define GESN_MEDIA_STATUS_TRAY_OPEN 0x01
 
+/* Takes io_lock for a poll, or fails at once - the poll skipped - if another
+ * command holds it, or if a command failed an attempt less than
+ * LASER_POLL_QUIET_MS ago. A poll only matters when the drive is idle, and
+ * the next one comes a second or two later. Queued behind a read the drive
+ * is failing, or slipping in while that read waits between two attempts -
+ * io_lock is free then (retry_delay()) - it sent its own command to a drive
+ * still stuck, timed out, and added a Reset Recovery between the read's
+ * attempts. Nothing is lost by skipping: the drive keeps a media event, and
+ * a UNIT ATTENTION, until it is reported. */
+static int poll_lock(laser_entry_t *entry)
+{
+    if (pthread_mutex_trylock(&entry->io_lock) != 0)
+        return 0;
+
+    if (entry->last_failure_ms != 0 &&
+        monotonic_ms_now() - entry->last_failure_ms < LASER_POLL_QUIET_MS) {
+        pthread_mutex_unlock(&entry->io_lock);
+        return 0;
+    }
+    return 1;
+}
+
 /* One GET EVENT STATUS NOTIFICATION, polled, media class.
  *
  * A single attempt, taken directly rather than through laser_scsi_cdb(): a
@@ -1881,7 +1925,10 @@ static laser_status_t media_events(laser_entry_t *entry,
     int rc = -1, csw_status = -1;
     uint8_t sense_key = 0xff, asc = 0, ascq = 0;
 
-    pthread_mutex_lock(&entry->io_lock);
+    /* A drive busy with another consumer's command is not polled: see
+     * poll_lock(). */
+    if (!poll_lock(entry))
+        return LASER_ERR_IO;
     for (int attempt = 1; attempt <= 2; attempt++) {
         memset(buf, 0, sizeof(buf));
         actual_len = 0;
@@ -1949,7 +1996,8 @@ static laser_status_t media_events(laser_entry_t *entry,
 static laser_status_t media_from_unit_ready(laser_entry_t *entry,
                                             laser_media_status_t *out)
 {
-    pthread_mutex_lock(&entry->io_lock);
+    if (!poll_lock(entry))
+        return LASER_ERR_IO;
 
     int rc = test_unit_ready_locked(entry);
     uint8_t sense_key = 0xff, asc = 0, ascq = 0;
