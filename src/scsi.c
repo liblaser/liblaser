@@ -1591,6 +1591,36 @@ static void lower_transfer_cap(laser_entry_t *entry, int bytes,
     }
 }
 
+/* Before a chunk of @p *chunk blocks at @p lba: whether it starts in the
+ * chunk the last read failed on - which this answer forgets - or else
+ * shortened to stop before it. See laser_entry_t::failed_lba. */
+static int known_failed_chunk(laser_entry_t *entry, uint32_t lba, int *chunk)
+{
+    int known = 0;
+
+    pthread_mutex_lock(&entry->io_lock);
+    if (entry->failed_blocks > 0) {
+        const uint32_t bad = entry->failed_lba;
+        if (lba >= bad && lba - bad < (uint32_t)entry->failed_blocks) {
+            entry->failed_blocks = 0;
+            known = 1;
+        } else if (bad > lba && bad - lba < (uint32_t)*chunk) {
+            *chunk = (int)(bad - lba);
+        }
+    }
+    pthread_mutex_unlock(&entry->io_lock);
+    return known;
+}
+
+static void remember_failed_chunk(laser_entry_t *entry, uint32_t lba,
+                                  int blocks)
+{
+    pthread_mutex_lock(&entry->io_lock);
+    entry->failed_lba = lba;
+    entry->failed_blocks = blocks;
+    pthread_mutex_unlock(&entry->io_lock);
+}
+
 /* The body shared by laser_read_blocks() and laser_read_cd_blocks(): reads
  * @p num_blocks blocks from @p lba into @p buffer, one command per chunk that
  * fits the device's transfer cap.
@@ -1623,6 +1653,10 @@ static void lower_transfer_cap(laser_entry_t *entry, int bytes,
  *
  * This terminates: every retry is strictly smaller than the transfer that
  * failed, and none goes below LASER_MIN_BYTES_PER_TRANSFER.
+ *
+ * A FAILED CHUNK is remembered, once: the read asking for its blocks next -
+ * this one's caller, after the short read - fails at once instead of
+ * spending the retries again. See laser_entry_t::failed_lba.
  *
  * @param token      registry token; the caller must hold a claim on it
  * @param lba        first block to read
@@ -1676,6 +1710,15 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
             chunk = max_blocks_per_chunk;
         }
 
+        /* The blocks the last read failed on, asked for again at once: they
+         * fail now, without the drive. */
+        if (entry != NULL &&
+            known_failed_chunk(entry, lba + (uint32_t)blocks_done, &chunk)) {
+            LOGI("token=%d: LBA %u failed the last read, not tried again "
+                 "at once", token, lba + (uint32_t)blocks_done);
+            return blocks_done > 0 ? blocks_done : (int)LASER_ERR_IO;
+        }
+
         uint8_t cdb[16];
         memset(cdb, 0, sizeof(cdb));
         build_cdb(cdb, lba + (uint32_t)blocks_done, chunk, ctx);
@@ -1711,6 +1754,10 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
                 continue;
             }
 
+            if (st == LASER_ERR_IO && entry != NULL) {
+                remember_failed_chunk(entry, lba + (uint32_t)blocks_done,
+                                      chunk);
+            }
             return blocks_done > 0 ? blocks_done : (int)st;
         }
 

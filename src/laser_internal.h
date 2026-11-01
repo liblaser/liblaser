@@ -116,6 +116,18 @@ typedef struct {
      * io_lock, read without it: a stale read negotiates once for nothing. */
     int largest_ok_bytes;
 
+    /* The chunk a read last failed on, its retries spent: its first block
+     * and block count, 0 blocks when none. A read failing after some chunks
+     * went through returns what it read, and its caller asks next for the
+     * very block that failed: that request fails at once rather than spend
+     * the retries again - over ten seconds on a drive stuck on a sector.
+     * Once only: the request it fails clears it, so a later read tries the
+     * drive again. See read_chunked() in scsi.c.
+     *
+     * Written and read under io_lock. */
+    uint32_t failed_lba;
+    int      failed_blocks;
+
     /* Raised by the laser_release() that drops the last claim, just before
      * teardown, and never cleared; the slot is memset afterwards. An
      * operation still running on another thread sees it between retry
