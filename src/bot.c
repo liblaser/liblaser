@@ -192,6 +192,17 @@ int laser_bot_send_locked(laser_entry_t *entry,
         *csw_status = -1;
     }
 
+    /* The phase timeouts: a probe's, or a command's. */
+    const unsigned int cbw_timeout = entry->probe_timeouts
+                                   ? PROBE_CBW_PHASE_TIMEOUT_MS
+                                   : CBW_PHASE_TIMEOUT_MS;
+    const unsigned int data_timeout = entry->probe_timeouts
+                                    ? PROBE_DATA_PHASE_TIMEOUT_MS
+                                    : DATA_PHASE_TIMEOUT_MS;
+    const unsigned int csw_timeout = entry->probe_timeouts
+                                   ? PROBE_CSW_PHASE_TIMEOUT_MS
+                                   : CSW_PHASE_TIMEOUT_MS;
+
     /* laser_scsi_cdb() already rejects this, but the memcpy below is the
      * overflow site, of a stack struct, and one comparison makes it
      * impossible whatever a caller does. */
@@ -212,9 +223,7 @@ int laser_bot_send_locked(laser_entry_t *entry,
 
     ret = libusb_bulk_transfer(entry->handle, entry->ep_out,
                                (unsigned char *)&cbw, USB_BOT_CBW_SIZE,
-                               &transferred,
-                               entry->probe_timeouts ? PROBE_CBW_PHASE_TIMEOUT_MS
-                                                     : CBW_PHASE_TIMEOUT_MS);
+                               &transferred, cbw_timeout);
     if (ret == LIBUSB_ERROR_NO_DEVICE) {
         LOGW("token=%d: device gone while sending the CBW", entry->token);
         return BOT_FAIL_NO_DEVICE;
@@ -252,9 +261,7 @@ int laser_bot_send_locked(laser_entry_t *entry,
         unsigned char ep = data_in ? entry->ep_in : entry->ep_out;
 
         ret = libusb_bulk_transfer(entry->handle, ep, data, data_len,
-                                   &transferred,
-                                   entry->probe_timeouts ? PROBE_DATA_PHASE_TIMEOUT_MS
-                                                         : DATA_PHASE_TIMEOUT_MS);
+                                   &transferred, data_timeout);
         if (ret == LIBUSB_ERROR_PIPE) {
             /* A stalled data endpoint is how a device ends a data phase early
              * (BBB 6.7.2/6.7.3), with its CSW already queued on the Bulk-In
@@ -315,8 +322,7 @@ int laser_bot_send_locked(laser_entry_t *entry,
 
     ret = libusb_bulk_transfer(entry->handle, entry->ep_in,
                                csw_buf, USB_BOT_CSW_SIZE, &transferred,
-                               entry->probe_timeouts ? PROBE_CSW_PHASE_TIMEOUT_MS
-                                                     : CSW_PHASE_TIMEOUT_MS);
+                               csw_timeout);
     if (ret == LIBUSB_ERROR_PIPE) {
         /* BBB 6.7.3 gives a stalled status phase one more chance: clear the
          * halt and read the CSW again. Only a second failure calls for a
@@ -333,8 +339,7 @@ int laser_bot_send_locked(laser_entry_t *entry,
         bot_clear_stall(entry, entry->ep_in);
         ret = libusb_bulk_transfer(entry->handle, entry->ep_in,
                                    csw_buf, USB_BOT_CSW_SIZE, &transferred,
-                                   entry->probe_timeouts ? PROBE_CSW_PHASE_TIMEOUT_MS
-                                                     : CSW_PHASE_TIMEOUT_MS);
+                                   csw_timeout);
     }
     if (ret == LIBUSB_ERROR_NO_DEVICE) {
         /* Before the Reset Recovery below, which would address a device that

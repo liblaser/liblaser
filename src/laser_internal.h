@@ -239,19 +239,16 @@ typedef struct {
     int             css_open;
     const void     *css_owner;
 
-    /* Raised during laser_wait_until_ready() and cleared when the unit
-     * answers ready, so it remains set only on a drive whose last wait ran
-     * out. Also cleared by laser_media_poll() on a new medium, which that
-     * wait did not see.
+    /* How the last readiness wait ended, a LASER_WAIT_* value, and
+     * LASER_WAIT_NOT_READY while one runs: anything but LASER_WAIT_READY
+     * only on a drive whose last wait ran out, and then why - an empty drive
+     * and one that never answered call for different answers in the user
+     * interface. Brought up to date by laser_token_settle() for such a
+     * drive, and set back to LASER_WAIT_READY by laser_media_poll() on a new
+     * medium, which that wait did not see.
      * Registration succeeds either way; laser_disc_identify() reads it to
-     * skip probes that would each spend a retry budget for nothing. */
-    int             not_ready;
-
-    /* How the last readiness wait ended, a LASER_WAIT_* value: why a drive is
-     * not ready, for laser_disc_identify() to say so - an empty drive and one
-     * that never answered call for different answers in the user interface.
-     * Brought up to date by laser_token_settle() for a drive whose wait had
-     * already run out. Written under io_lock, read without it. */
+     * skip probes that would each spend a retry budget for nothing. Written
+     * under io_lock, read without it. */
     int             wait_state;
 
     /* Set once the drive has failed to answer GET EVENT STATUS NOTIFICATION
@@ -331,6 +328,14 @@ int laser_find_bulk_endpoints(laser_entry_t *entry);
 void laser_mass_storage_reset(laser_entry_t *entry);
 
 /**
+ * GET MAX LUN (class request to entry->iface_num): the number of the
+ * device's last logical unit, 0 for a single unit; -1 if the device stalled
+ * the request or did not answer it, which the class specification reads as
+ * a single unit.
+ */
+int laser_get_max_lun(laser_entry_t *entry);
+
+/**
  * Unlock the tray: PREVENT ALLOW MEDIUM REMOVAL with Prevent = 00b.
  *
  * Linux's sr driver locks the tray while the disc is mounted, and unlocks it
@@ -345,7 +350,7 @@ void laser_allow_medium_removal(laser_entry_t *entry);
  * Wake the drive and wait for its medium to become ready, before any read.
  * Called at registration, after laser_probe_lun() has found a unit that
  * answers, and again by laser_token_settle(). Best-effort: a drive that never
- * reports ready is still registered, with laser_entry_t::not_ready left set.
+ * reports ready is still registered, laser_entry_t::wait_state saying why.
  *
  * Bounded in real time by LASER_SPINUP_MAX_WALL_MS (15 s), raised to
  * LASER_BECOMING_READY_MAX_WALL_MS (30 s) for a drive that says it is becoming

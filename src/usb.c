@@ -22,8 +22,9 @@
  *****************************************************************************
  * USB-level work below the SCSI layer: finding the interface that carries
  * the Bulk-Only function and its bulk endpoint pair, once at registration,
- * and the Mass Storage Reset that puts the device's BOT state machine in a
- * known state - at registration, in Reset Recovery and at teardown.
+ * the Mass Storage Reset that puts the device's BOT state machine in a known
+ * state - at registration, in Reset Recovery and at teardown - and GET MAX
+ * LUN, the other class request.
  *
  * No CBW here (bot.c), no retries or sense codes (scsi.c).
  *****************************************************************************/
@@ -38,6 +39,12 @@
  * the bulk pipes - hence here rather than in bot.c. */
 #define USB_BOT_RESET_bREQUEST        0xFF
 #define USB_BOT_RESET_bmREQUESTTYPE   0x21  /* Class | Interface | Host-to-Device */
+
+/* GET MAX LUN, the other Bulk-Only class request: Device-to-Host, returning
+ * one byte, the number of the LAST logical unit (0 means one unit). A device
+ * with a single unit may stall it. */
+#define USB_BOT_GETMAXLUN_bREQUEST      0xFE
+#define USB_BOT_GETMAXLUN_bmREQUESTTYPE 0xA1  /* Class | Interface | Dev-to-Host */
 
 /* ============================================================================
  * Endpoint discovery, called once from laser_register() in registry.c,
@@ -171,8 +178,19 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
 }
 
 /* ============================================================================
- * Mass Storage Reset - see laser_internal.h.
+ * Bulk-Only class requests - see laser_internal.h.
  * ============================================================================ */
+
+int laser_get_max_lun(laser_entry_t *entry)
+{
+    unsigned char max_lun = 0;
+    int ret = libusb_control_transfer(entry->handle,
+                                      USB_BOT_GETMAXLUN_bmREQUESTTYPE,
+                                      USB_BOT_GETMAXLUN_bREQUEST,
+                                      0, entry->iface_num,
+                                      &max_lun, 1, 3000);
+    return ret == 1 ? max_lun : -1;
+}
 
 void laser_mass_storage_reset(laser_entry_t *entry)
 {

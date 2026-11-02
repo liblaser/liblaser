@@ -22,8 +22,8 @@
  *****************************************************************************
  * Everything that needs to know what a command MEANS: sense-code
  * classification, the retry policy, the probes run once at registration
- * (INQUIRY, GET MAX LUN, TEST UNIT READY), the DVD region check and the
- * chunked block reads.
+ * (INQUIRY, TEST UNIT READY), the DVD region check and the chunked block
+ * reads.
  *
  * Every transaction goes through laser_bot_send_locked() in bot.c, which
  * knows the wire format and nothing else. Keeping the resilience here spares
@@ -134,7 +134,7 @@
  * the full budget made a few such sectors outlast classification's minute. */
 #define LASER_READ_MAX_MEDIUM_ERRORS 2
 
-/* For a read - READ(10), READ(12), READ CD - its first block and block count:
+/* For a read - READ(10), READ CD - its first block and block count:
  * for the log, since which sectors failed tells which file, and so which
  * consumer, was reading; and for the throughput sample, which counts only
  * reads following each other. Writes " lba N x M" into [buf], or an empty
@@ -149,12 +149,6 @@ static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size
     switch (cdb_len >= 10 ? cdb[0] : 0) {
     case 0x28:  /* READ(10) */
         count = (uint32_t)cdb[7] << 8 | cdb[8];
-        break;
-    case 0xa8:  /* READ(12) */
-        if (cdb_len < 12)
-            return 0;
-        count = (uint32_t)cdb[6] << 24 | (uint32_t)cdb[7] << 16 |
-                (uint32_t)cdb[8] << 8 | cdb[9];
         break;
     case 0xbe:  /* READ CD */
         if (cdb_len < 12)
@@ -208,12 +202,6 @@ static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size
  * last "becoming ready", within LASER_BECOMING_READY_MAX_WALL_MS. */
 #define LASER_NO_MEDIUM_AFTER_LOADING_MS 10000
 
-/* GET MAX LUN: Bulk-Only class request, Device-to-Host, returning one byte,
- * the number of the LAST logical unit (0 means one unit). A device with a
- * single unit may stall it. */
-#define USB_BOT_GETMAXLUN_bREQUEST      0xFE
-#define USB_BOT_GETMAXLUN_bmREQUESTTYPE 0xA1  /* Class | Interface | Dev-to-Host */
-
 /* Highest LUN probed, whatever the device claims: each unit costs an INQUIRY
  * at registration, and combo enclosures use two at most. */
 #define LASER_MAX_LUN_PROBED 3
@@ -237,23 +225,78 @@ static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size
 #define LASER_INQUIRY_MAX_ATTEMPTS 7
 #define LASER_INQUIRY_RETRY_MS     100
 
-/* Forward declaration: the spin-up wait needs it before its definition. */
+/* Forward declaration: command_locked() needs it before its definition. */
 static int request_sense_locked(laser_entry_t *entry,
                                 uint8_t *sense_key, uint8_t *asc, uint8_t *ascq);
 
+/* One command, without the retries of laser_scsi_cdb(), and why it failed:
+ * when its CSW says FAIL, the sense REQUEST SENSE reads, into @p sense_key,
+ * @p asc and @p ascq - left 0xff/00/00 otherwise, and not asked for when
+ * @p sense_key is NULL. A data phase, if any, is DATA-IN.
+ *
+ * Returns laser_bot_send_locked()'s code; @p actual_len and @p csw_status
+ * may be NULL.
+ *
+ * Caller MUST already hold entry->io_lock. */
+static int command_locked(laser_entry_t *entry, const uint8_t *cdb,
+                          int cdb_len, uint8_t *data, int data_len,
+                          int *actual_len, int *csw_status,
+                          uint8_t *sense_key, uint8_t *asc, uint8_t *ascq)
+{
+    int status = -1;
+    int rc = laser_bot_send_locked(entry, cdb, cdb_len, data, data_len,
+                                   data_len > 0, actual_len, &status);
+    if (csw_status != NULL)
+        *csw_status = status;
+
+    if (sense_key != NULL) {
+        *sense_key = 0xff;
+        *asc = 0;
+        *ascq = 0;
+        if (rc != 0 && status == USB_BOT_STATUS_FAIL)
+            request_sense_locked(entry, sense_key, asc, ascq);
+    }
+    return rc;
+}
+
 /* SCSI TEST UNIT READY (opcode 0x00): no data phase, the CSW status alone
- * says whether the unit is ready.
+ * says whether the unit is ready, the sense why not - as command_locked().
  *
  * Returns laser_bot_send_locked()'s code as is: 0 means ready,
  * BOT_FAIL_NO_DEVICE means gone, anything else not ready yet.
  *
  * Caller MUST already hold entry->io_lock. */
-static int test_unit_ready_locked(laser_entry_t *entry)
+static int test_unit_ready_locked(laser_entry_t *entry, uint8_t *sense_key,
+                                  uint8_t *asc, uint8_t *ascq)
 {
-    uint8_t cdb[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    int csw_status = -1;
-    return laser_bot_send_locked(entry, cdb, sizeof(cdb),
-                                   NULL, 0, 0, NULL, &csw_status);
+    static const uint8_t cdb[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    return command_locked(entry, cdb, sizeof(cdb), NULL, 0, NULL, NULL,
+                          sense_key, asc, ascq);
+}
+
+/* What a sense says of the medium. */
+typedef enum {
+    MEDIUM_SENSE_OTHER = 0,
+    /** 02h/3Ah, tray closed or no qualifier: an empty tray, and a parked
+     * drive holding a disc alike. */
+    MEDIUM_SENSE_ABSENT,
+    /** 02h/3Ah/02h. */
+    MEDIUM_SENSE_TRAY_OPEN,
+    /** 02h/04h, becoming ready: the drive is loading or spinning up. */
+    MEDIUM_SENSE_LOADING,
+} medium_sense_t;
+
+static medium_sense_t medium_sense(uint8_t sense_key, uint8_t asc,
+                                   uint8_t ascq)
+{
+    if (sense_key != SCSI_SENSE_KEY_NOT_READY)
+        return MEDIUM_SENSE_OTHER;
+    if (asc == SCSI_ASC_MEDIUM_NOT_PRESENT)
+        return ascq == SCSI_ASCQ_TRAY_OPEN ? MEDIUM_SENSE_TRAY_OPEN
+                                           : MEDIUM_SENSE_ABSENT;
+    if (asc == SCSI_ASC_BECOMING_READY)
+        return MEDIUM_SENSE_LOADING;
+    return MEDIUM_SENSE_OTHER;
 }
 
 /* Sleeps @p ms with io_lock released, then takes it again: for the delays
@@ -291,18 +334,10 @@ static int laser_must_stop(const laser_entry_t *entry)
            (abort_cb != NULL && abort_cb(abort_opaque));
 }
 
-/* Milliseconds elapsed since *start on CLOCK_MONOTONIC, so that a budget is
- * not stretched or cut by the system clock being stepped, which Android does
- * routinely after a boot or a network change. */
-static long monotonic_ms_since(const struct timespec *start)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (now.tv_sec - start->tv_sec) * 1000L
-           + (now.tv_nsec - start->tv_nsec) / 1000000L;
-}
-
-/* Now on CLOCK_MONOTONIC, in milliseconds - for a time kept in an entry. */
+/* Now on CLOCK_MONOTONIC, in milliseconds: for the budgets, which the
+ * system clock being stepped - as Android does routinely after a boot or a
+ * network change - must not stretch or cut, and for a time kept in an
+ * entry. */
 static int64_t monotonic_ms_now(void)
 {
     struct timespec now;
@@ -404,17 +439,9 @@ static int start_stop_unit_locked(laser_entry_t *entry,
     cdb[1] = immed; /* bit 0 IMMED */
     cdb[4] = byte4; /* bit 0 START, bit 1 LOEJ */
 
-    int csw_status = -1;
-    int rc = laser_bot_send_locked(entry, cdb, sizeof(cdb),
-                                   NULL, 0, 0, NULL, &csw_status);
-
-    *sense_key = 0xff;
-    *asc = 0;
-    *ascq = 0;
-
-    if (rc != 0 && csw_status == USB_BOT_STATUS_FAIL) {
-        request_sense_locked(entry, sense_key, asc, ascq);
-    }
+    int csw_status;
+    int rc = command_locked(entry, cdb, sizeof(cdb), NULL, 0, NULL,
+                            &csw_status, sense_key, asc, ascq);
 
     LOGI("token=%d: START STOP UNIT immed=%u byte4=0x%02x -> rc=%d csw=%d "
          "sense %02x/%02x/%02x",
@@ -433,14 +460,10 @@ void laser_allow_medium_removal(laser_entry_t *entry)
 
     pthread_mutex_lock(&entry->io_lock);
 
-    int csw_status = -1;
-    int rc = laser_bot_send_locked(entry, cdb, sizeof(cdb),
-                                   NULL, 0, 0, NULL, &csw_status);
-
-    uint8_t sense_key = 0xff, asc = 0, ascq = 0;
-    if (rc != 0 && csw_status == USB_BOT_STATUS_FAIL) {
-        request_sense_locked(entry, &sense_key, &asc, &ascq);
-    }
+    int csw_status;
+    uint8_t sense_key, asc, ascq;
+    int rc = command_locked(entry, cdb, sizeof(cdb), NULL, 0, NULL,
+                            &csw_status, &sense_key, &asc, &ascq);
 
     pthread_mutex_unlock(&entry->io_lock);
 
@@ -513,8 +536,7 @@ static void spin_up_locked(laser_entry_t *entry)
         return;
     }
 
-    if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-        asc == SCSI_ASC_BECOMING_READY) {
+    if (medium_sense(sense_key, asc, ascq) == MEDIUM_SENSE_LOADING) {
         LOGI("token=%d: drive already becoming ready, no further START STOP "
              "UNIT", entry->token);
         return;
@@ -531,8 +553,7 @@ static void spin_up_locked(laser_entry_t *entry)
 
     /* The tray is open: LOEJ would close it on the user. The wait that
      * follows sees the open tray and ends at once. */
-    if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-        asc == SCSI_ASC_MEDIUM_NOT_PRESENT && ascq == SCSI_ASCQ_TRAY_OPEN) {
+    if (medium_sense(sense_key, asc, ascq) == MEDIUM_SENSE_TRAY_OPEN) {
         LOGI("token=%d: tray open, not loading it", entry->token);
         return;
     }
@@ -542,8 +563,65 @@ static void spin_up_locked(laser_entry_t *entry)
     start_stop_unit_locked(entry, 1, 0x03, &sense_key, &asc, &ascq);
 }
 
-/* GET EVENT STATUS NOTIFICATION (opcode 4Ah), media class, polled: what the
- * drive believes about its tray and medium, for the log of a given-up wait.
+/* GET EVENT STATUS NOTIFICATION (opcode 4Ah), media class: the event codes
+ * in the low nibble of the descriptor's first byte, the status bits in its
+ * second. */
+#define GESN_CLASS_MEDIA            4
+#define GESN_MEDIA_EJECT_REQUEST    1
+#define GESN_MEDIA_NEW              2
+#define GESN_MEDIA_REMOVAL          3
+#define GESN_MEDIA_CHANGED          4
+#define GESN_MEDIA_STATUS_TRAY_OPEN 0x01
+#define GESN_MEDIA_STATUS_PRESENT   0x02
+
+/* An answer of GET EVENT STATUS NOTIFICATION, media class. */
+typedef struct {
+    int     nea;        /* no event of the class asked for is supported */
+    int     cls;        /* the class answered */
+    int     event;      /* GESN_MEDIA_* */
+    int     tray_open;
+    int     present;    /* not trusted: see laser_medium_t */
+    uint8_t raw[4];     /* bytes 2 to 5, for the log */
+    int     length;     /* bytes received */
+} gesn_media_t;
+
+/* One GET EVENT STATUS NOTIFICATION, polled, media class, decoded into
+ * @p out. Returns laser_bot_send_locked()'s code, -1 for an answer too short
+ * to decode; the sense as command_locked(), @p sense_key may be NULL.
+ *
+ * Caller MUST already hold entry->io_lock. */
+static int gesn_media_locked(laser_entry_t *entry, gesn_media_t *out,
+                             uint8_t *sense_key, uint8_t *asc, uint8_t *ascq)
+{
+    uint8_t cdb[10] = { 0 };
+    cdb[0] = 0x4a;                  /* GET EVENT STATUS NOTIFICATION */
+    cdb[1] = 0x01;                  /* Polled */
+    cdb[4] = 1 << GESN_CLASS_MEDIA; /* notification class request */
+    cdb[8] = 0x08;                  /* header + media event descriptor */
+
+    uint8_t buf[8] = { 0 };
+    memset(out, 0, sizeof(*out));
+    int rc = command_locked(entry, cdb, sizeof(cdb), buf, sizeof(buf),
+                            &out->length, NULL, sense_key, asc, ascq);
+    if (rc != 0)
+        return rc;
+    if (out->length < 8)
+        return -1;
+
+    /* Header: [0..1] descriptor length, [2] bit 7 NEA and the class in bits
+     * 0-2, [3] supported classes. Media descriptor: [4] event code, [5]
+     * status bits, [6..7] slot range. */
+    out->nea       = (buf[2] & 0x80) != 0;
+    out->cls       = buf[2] & 0x07;
+    out->event     = buf[4] & 0x0f;
+    out->tray_open = (buf[5] & GESN_MEDIA_STATUS_TRAY_OPEN) != 0;
+    out->present   = (buf[5] & GESN_MEDIA_STATUS_PRESENT) != 0;
+    memcpy(out->raw, buf + 2, sizeof(out->raw));
+    return 0;
+}
+
+/* What the drive believes about its tray and medium, for the log of a
+ * given-up wait.
  *
  * Diagnostic only, and not ground truth: it is the same firmware's belief as
  * the sense data, and has reported "tray closed, medium absent" for a disc
@@ -552,33 +630,14 @@ static void spin_up_locked(laser_entry_t *entry)
  * Caller MUST already hold entry->io_lock. */
 static void log_media_status_locked(laser_entry_t *entry)
 {
-    uint8_t cdb[10] = { 0 };
-    cdb[0] = 0x4a; /* GET EVENT STATUS NOTIFICATION */
-    cdb[1] = 0x01; /* Polled */
-    cdb[4] = 0x10; /* notification class request: bit 4 = media */
-    cdb[7] = 0x00;
-    cdb[8] = 0x08; /* allocation length: header + media event descriptor */
-
-    uint8_t buf[8] = { 0 };
-    int actual_len = 0;
-    int rc = laser_bot_send_locked(entry, cdb, sizeof(cdb), buf, sizeof(buf),
-                                     1, &actual_len, NULL);
-
-    if (rc != 0 || actual_len < 8) {
+    gesn_media_t g;
+    int rc = gesn_media_locked(entry, &g, NULL, NULL, NULL);
+    if (rc != 0) {
         LOGI("token=%d: media status unavailable (rc=%d, %d bytes) - the "
              "drive does not support 4Ah, or would not answer it",
-             entry->token, rc, actual_len);
+             entry->token, rc, g.length);
         return;
     }
-
-    /* Header: [0..1] descriptor length, [2] bit7 NEA + class in bits 0-2,
-     * [3] supported classes. Media descriptor: [4] event code in the low
-     * nibble, [5] status bits, [6..7] slot range. */
-    int no_event = (buf[2] & 0x80) != 0;
-    int class = buf[2] & 0x07;
-    int event = buf[4] & 0x0f;
-    int tray_open = (buf[5] & 0x01) != 0;
-    int media_present = (buf[5] & 0x02) != 0;
 
     static const char *const events[] = {
         "no change", "eject request", "new media", "media removal",
@@ -588,19 +647,11 @@ static void log_media_status_locked(laser_entry_t *entry)
     LOGI("token=%d: media status: tray %s, medium %s, last event %s "
          "(nea=%d class=%d raw=%02x %02x %02x %02x)",
          entry->token,
-         tray_open ? "OPEN" : "closed",
-         media_present ? "PRESENT" : "absent",
-         event < (int)(sizeof(events) / sizeof(events[0])) ? events[event]
-                                                           : "unknown",
-         no_event, class, buf[2], buf[3], buf[4], buf[5]);
-}
-
-/* How a readiness wait ended - see laser_entry_t::wait_state. Caller MUST
- * hold entry->io_lock. */
-static void wait_end_locked(laser_entry_t *entry, int state)
-{
-    entry->wait_state = state;
-    entry->not_ready = state != LASER_WAIT_READY;
+         g.tray_open ? "OPEN" : "closed",
+         g.present ? "PRESENT" : "absent",
+         g.event < (int)(sizeof(events) / sizeof(events[0])) ? events[g.event]
+                                                             : "unknown",
+         g.nea, g.cls, g.raw[0], g.raw[1], g.raw[2], g.raw[3]);
 }
 
 /* Wake the drive and wait for its medium to become ready - see the contract
@@ -622,13 +673,7 @@ static void wait_end_locked(laser_entry_t *entry, int state)
  * run it again on a published one. */
 void laser_wait_until_ready(laser_entry_t *entry)
 {
-    struct timespec started;
-    clock_gettime(CLOCK_MONOTONIC, &started);
-
-    /* When START STOP UNIT went out: the start of the no-medium ceiling,
-     * since "not yet" only means something once the drive was asked to
-     * load. */
-    struct timespec no_medium_since = started;
+    const int64_t started = monotonic_ms_now();
 
     pthread_mutex_lock(&entry->io_lock);
 
@@ -637,29 +682,35 @@ void laser_wait_until_ready(laser_entry_t *entry)
      * never be told to load. One command too many on a drive that did not
      * need it. */
     spin_up_locked(entry);
-    clock_gettime(CLOCK_MONOTONIC, &no_medium_since);
 
-    /* Lowered only by the ready return below, so that every other way out of
-     * the loop leaves it raised - set again by wait_end_locked(), since a poll
-     * may lower it while the wait sleeps. */
-    entry->not_ready = 1;
+    /* When START STOP UNIT went out: the start of the no-medium ceiling,
+     * since "not yet" only means something once the drive was asked to
+     * load. */
+    const int64_t no_medium_since = monotonic_ms_now();
+
+    /* Not ready while the wait runs: only the ready return below says
+     * otherwise. Set again on every way out, since a poll may change it
+     * while the wait sleeps. */
+    entry->wait_state = LASER_WAIT_NOT_READY;
 
     /* Whether the drive said it was spinning up, for the device-gone report
      * below and the no-medium ceiling, and when it last said so. */
     int becoming_ready = 0;
-    struct timespec becoming_ready_last = started;
+    int64_t becoming_ready_last = started;
     int unit_attentions = 0;
 
     /* Bounded by the ceilings alone: every path below either returns, sleeps
      * and meets a ceiling check, or is a UNIT ATTENTION retry, itself
      * bounded. */
     for (int attempt = 1; ; attempt++) {
-        int rc = test_unit_ready_locked(entry);
+        uint8_t sense_key, asc, ascq;
+        int rc = test_unit_ready_locked(entry, &sense_key, &asc, &ascq);
+        const int64_t now = monotonic_ms_now();
 
         if (rc == 0) {
-            LOGI("token=%d: unit ready (attempt %d, %ldms)",
-                 entry->token, attempt, monotonic_ms_since(&started));
-            wait_end_locked(entry, LASER_WAIT_READY);
+            LOGI("token=%d: unit ready (attempt %d, %lldms)",
+                 entry->token, attempt, (long long)(now - started));
+            entry->wait_state = LASER_WAIT_READY;
             pthread_mutex_unlock(&entry->io_lock);
             return;
         }
@@ -672,72 +723,66 @@ void laser_wait_until_ready(laser_entry_t *entry)
              * peak current - is the signature of a port that cannot power it.
              * Every layer above only sees a device that disappeared. */
             if (becoming_ready) {
-                LOGW("token=%d: it was spinning up when it went (%ldms in) - "
+                LOGW("token=%d: it was spinning up when it went (%lldms in) - "
                      "suspect the port's power budget, not the drive: try a "
                      "powered hub or a Y-cable",
-                     entry->token, monotonic_ms_since(&started));
+                     entry->token, (long long)(now - started));
             }
 
-            wait_end_locked(entry, LASER_WAIT_NOT_READY);
+            entry->wait_state = LASER_WAIT_NOT_READY;
             pthread_mutex_unlock(&entry->io_lock);
             return;
         }
-
-        uint8_t sense_key = 0xff, asc = 0, ascq = 0;
-        request_sense_locked(entry, &sense_key, &asc, &ascq);
 
         /* Logged raw: 02h/3Ah, 02h/04h/01h and 06h/28h/00h call for different
          * handling, and the messages below do not show which arrived. */
         LOGI("token=%d: sense %02x/%02x/%02x (attempt %d)",
              entry->token, sense_key, asc, ascq, attempt);
 
-        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-            asc == SCSI_ASC_BECOMING_READY) {
+        const medium_sense_t medium = medium_sense(sense_key, asc, ascq);
+        if (medium == MEDIUM_SENSE_LOADING) {
             becoming_ready = 1;
-            clock_gettime(CLOCK_MONOTONIC, &becoming_ready_last);
+            becoming_ready_last = now;
         }
 
-        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-            asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
-            if (ascq == SCSI_ASCQ_TRAY_OPEN) {
-                LOGW("token=%d: tray open (attempt %d), giving up wait",
-                     entry->token, attempt);
-                log_media_status_locked(entry);
-                wait_end_locked(entry, LASER_WAIT_TRAY_OPEN);
-                pthread_mutex_unlock(&entry->io_lock);
-                return;
-            }
+        if (medium == MEDIUM_SENSE_TRAY_OPEN) {
+            LOGW("token=%d: tray open (attempt %d), giving up wait",
+                 entry->token, attempt);
+            log_media_status_locked(entry);
+            entry->wait_state = LASER_WAIT_TRAY_OPEN;
+            pthread_mutex_unlock(&entry->io_lock);
+            return;
+        }
 
-            /* Tray closed, or no qualifier: an empty tray and a parked drive
-             * holding a disc alike. Keep polling; the shorter ceiling bounds
-             * the empty case - unless the drive was loading a disc, see
-             * LASER_NO_MEDIUM_AFTER_LOADING_MS. */
-            long no_medium_ms = monotonic_ms_since(&no_medium_since);
+        if (medium == MEDIUM_SENSE_ABSENT) {
+            /* An empty tray and a parked drive holding a disc alike. Keep
+             * polling; the shorter ceiling bounds the empty case - unless the
+             * drive was loading a disc, see LASER_NO_MEDIUM_AFTER_LOADING_MS. */
+            const int64_t no_medium_ms = now - no_medium_since;
             const int loading = becoming_ready &&
-                monotonic_ms_since(&becoming_ready_last) <
-                    LASER_NO_MEDIUM_AFTER_LOADING_MS &&
-                monotonic_ms_since(&started) < LASER_BECOMING_READY_MAX_WALL_MS;
+                now - becoming_ready_last < LASER_NO_MEDIUM_AFTER_LOADING_MS &&
+                now - started < LASER_BECOMING_READY_MAX_WALL_MS;
             if (no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS && !loading) {
-                LOGW("token=%d: still no medium %ldms after START STOP UNIT "
+                LOGW("token=%d: still no medium %lldms after START STOP UNIT "
                      "(attempt %d), giving up wait",
-                     entry->token, no_medium_ms, attempt);
+                     entry->token, (long long)no_medium_ms, attempt);
                 log_media_status_locked(entry);
-                wait_end_locked(entry, LASER_WAIT_NO_MEDIUM);
+                entry->wait_state = LASER_WAIT_NO_MEDIUM;
                 pthread_mutex_unlock(&entry->io_lock);
                 return;
             }
 
             if (loading && no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS)
                 LOGI("token=%d: no medium yet, waiting %dms (attempt %d, "
-                     "%ldms since the drive said it was loading, up to %dms)",
+                     "%lldms since the drive said it was loading, up to %dms)",
                      entry->token, LASER_SPINUP_DELAY_MS, attempt,
-                     monotonic_ms_since(&becoming_ready_last),
+                     (long long)(now - becoming_ready_last),
                      LASER_NO_MEDIUM_AFTER_LOADING_MS);
             else
                 LOGI("token=%d: no medium yet, waiting %dms (attempt %d, "
-                     "%ldms of %dms since START STOP UNIT)",
+                     "%lldms of %dms since START STOP UNIT)",
                      entry->token, LASER_SPINUP_DELAY_MS, attempt,
-                     no_medium_ms, LASER_NO_MEDIUM_MAX_WALL_MS);
+                     (long long)no_medium_ms, LASER_NO_MEDIUM_MAX_WALL_MS);
             sleep_unlocked(entry, LASER_SPINUP_DELAY_MS);
             continue;
         }
@@ -755,25 +800,26 @@ void laser_wait_until_ready(laser_entry_t *entry)
         /* Checked before committing to another round, so that the ceiling
          * bounds the time actually spent; after the sense checks, so that an
          * open tray or a missing medium ends the wait on its own terms. */
-        long elapsed = monotonic_ms_since(&started);
-        long ceiling = becoming_ready ? LASER_BECOMING_READY_MAX_WALL_MS
-                                      : LASER_SPINUP_MAX_WALL_MS;
+        const int64_t elapsed = now - started;
+        const int ceiling = becoming_ready ? LASER_BECOMING_READY_MAX_WALL_MS
+                                           : LASER_SPINUP_MAX_WALL_MS;
         if (elapsed >= ceiling) {
-            LOGW("token=%d: spin-up wall-clock budget exhausted (%ldms over "
+            LOGW("token=%d: spin-up wall-clock budget exhausted (%lldms over "
                  "%d attempts), proceeding anyway",
-                 entry->token, elapsed, attempt);
+                 entry->token, (long long)elapsed, attempt);
             break;
         }
 
-        LOGI("token=%d: drive not ready, waiting %dms (attempt %d, %ldms "
-             "of %ldms elapsed)",
-             entry->token, LASER_SPINUP_DELAY_MS, attempt, elapsed, ceiling);
+        LOGI("token=%d: drive not ready, waiting %dms (attempt %d, %lldms "
+             "of %dms elapsed)",
+             entry->token, LASER_SPINUP_DELAY_MS, attempt, (long long)elapsed,
+             ceiling);
         sleep_unlocked(entry, LASER_SPINUP_DELAY_MS);
     }
 
-    LOGW("token=%d: drive did not become ready after %ldms, proceeding anyway",
-         entry->token, monotonic_ms_since(&started));
-    wait_end_locked(entry, LASER_WAIT_NOT_READY);
+    LOGW("token=%d: drive did not become ready after %lldms, proceeding "
+         "anyway", entry->token, (long long)(monotonic_ms_now() - started));
+    entry->wait_state = LASER_WAIT_NOT_READY;
     pthread_mutex_unlock(&entry->io_lock);
 }
 
@@ -782,8 +828,8 @@ void laser_wait_until_ready(laser_entry_t *entry)
  * is not ready, not why.
  *
  * A drive whose wait already ran out ("never became ready") is checked once
- * more but not waited for again: ready now, its flag is lowered; still not
- * ready, it keeps it - a new medium lowers it too (laser_media_poll()). */
+ * more but not waited for again: ready now, its state is ready; still not
+ * ready, it keeps it - a new medium resets it too (laser_media_poll()). */
 void laser_token_settle(int token)
 {
     laser_entry_t *entry = laser_lookup(token);
@@ -791,24 +837,29 @@ void laser_token_settle(int token)
         return;
 
     pthread_mutex_lock(&entry->io_lock);
-    int rc = test_unit_ready_locked(entry);
-    const int was_not_ready = entry->not_ready;
+    const int was_not_ready = entry->wait_state != LASER_WAIT_READY;
+    uint8_t sense_key = 0xff, asc = 0, ascq = 0;
+    int rc = test_unit_ready_locked(entry, was_not_ready ? &sense_key : NULL,
+                                    &asc, &ascq);
     int loading = 0;
     if (rc == 0) {
-        wait_end_locked(entry, LASER_WAIT_READY);
+        entry->wait_state = LASER_WAIT_READY;
     } else if (rc != BOT_FAIL_NO_DEVICE && was_not_ready) {
         /* Not waited for again, but the reason is brought up to date: the
          * tray may have been opened, or closed on an empty drive, since. */
-        uint8_t sense_key = 0xff, asc = 0, ascq = 0;
-        request_sense_locked(entry, &sense_key, &asc, &ascq);
-        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-            asc == SCSI_ASC_MEDIUM_NOT_PRESENT)
-            wait_end_locked(entry, ascq == SCSI_ASCQ_TRAY_OPEN
-                                   ? LASER_WAIT_TRAY_OPEN
-                                   : LASER_WAIT_NO_MEDIUM);
-        else if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-                 asc == SCSI_ASC_BECOMING_READY)
+        switch (medium_sense(sense_key, asc, ascq)) {
+        case MEDIUM_SENSE_TRAY_OPEN:
+            entry->wait_state = LASER_WAIT_TRAY_OPEN;
+            break;
+        case MEDIUM_SENSE_ABSENT:
+            entry->wait_state = LASER_WAIT_NO_MEDIUM;
+            break;
+        case MEDIUM_SENSE_LOADING:
             loading = 1;
+            break;
+        case MEDIUM_SENSE_OTHER:
+            break;
+        }
     }
     pthread_mutex_unlock(&entry->io_lock);
 
@@ -886,26 +937,18 @@ int laser_probe_lun(laser_entry_t *entry)
     /* Set first, so that every early return leaves a usable value. */
     entry->lun = 0;
 
-    unsigned char max_lun_buf = 0;
-    int ret = libusb_control_transfer(entry->handle,
-                                      USB_BOT_GETMAXLUN_bmREQUESTTYPE,
-                                      USB_BOT_GETMAXLUN_bREQUEST,
-                                      0, entry->iface_num,
-                                      &max_lun_buf, 1, 3000);
-    int max_lun = 0;
-    if (ret != 1) {
+    int max_lun = laser_get_max_lun(entry);
+    if (max_lun < 0) {
         /* Stalled or unanswered means a single unit, per the class
          * specification: the common case, not worth a warning. */
         LOGI("token=%d: GET MAX LUN unsupported or failed, assuming single LUN",
              entry->token);
-    } else {
-        max_lun = max_lun_buf;
+        max_lun = 0;
+    } else if (max_lun > 0) {
+        LOGI("usb %04x:%04x: device reports %d logical units, looking for "
+             "the optical one", entry->vid, entry->pid, max_lun + 1);
         if (max_lun > LASER_MAX_LUN_PROBED)
             max_lun = LASER_MAX_LUN_PROBED;
-        if (max_lun > 0) {
-            LOGI("usb %04x:%04x: device reports %d logical units, looking for "
-                 "the optical one", entry->vid, entry->pid, max_lun_buf + 1);
-        }
     }
 
     /* Ask each unit what it is, and take the first CD/DVD one. entry->lun
@@ -1119,7 +1162,7 @@ laser_status_t laser_scsi_cdb(int token,
 
     /* Set by the first 04h/01h BECOMING READY: see its branch below. */
     int becoming_ready = 0;
-    struct timespec becoming_ready_since;
+    int64_t becoming_ready_since = 0;
 
     /* Which sectors a read asks for, appended to its messages; and its
      * Reset Recoveries in a row, see LASER_READ_MAX_RESETS. */
@@ -1216,8 +1259,8 @@ laser_status_t laser_scsi_cdb(int token,
          * once. Every 3Ah qualifier, unlike in the spin-up wait: that wait
          * has already run, so a fresh 3Ah here means the disc really is
          * gone. */
-        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-            asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
+        const medium_sense_t medium = medium_sense(sense_key, asc, ascq);
+        if (medium == MEDIUM_SENSE_ABSENT || medium == MEDIUM_SENSE_TRAY_OPEN) {
             LOGW("token=%d: no disc present (%02x/%02x/%02x), not retrying",
                  token, sense_key, asc, ascq);
             result = LASER_ERR_MEDIA_GONE;
@@ -1230,11 +1273,11 @@ laser_status_t laser_scsi_cdb(int token,
              * READY TO READY change that ends a spin-up, not a disc swap.
              * Retried at once, without spending an attempt; once only, since
              * both flags are cleared. */
-            if (becoming_ready || entry->not_ready) {
+            if (becoming_ready || entry->wait_state != LASER_WAIT_READY) {
                 LOGI("token=%d: drive now ready (06/28/00 after spin-up), "
                      "retrying cdb 0x%02x", token, cdb[0]);
                 becoming_ready = 0;
-                wait_end_locked(entry, LASER_WAIT_READY);
+                entry->wait_state = LASER_WAIT_READY;
                 attempt--;
                 continue;
             }
@@ -1327,16 +1370,15 @@ laser_status_t laser_scsi_cdb(int token,
          * minutes took 45 s, past the spin-up wait at registration. Waited
          * out under LASER_BECOMING_READY_MAX_WALL_MS, without spending
          * attempts; cancellation is still checked on every round. */
-        if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-            asc == SCSI_ASC_BECOMING_READY) {
+        if (medium == MEDIUM_SENSE_LOADING) {
             if (!becoming_ready) {
                 becoming_ready = 1;
-                clock_gettime(CLOCK_MONOTONIC, &becoming_ready_since);
+                becoming_ready_since = monotonic_ms_now();
                 LOGI("token=%d: cdb 0x%02x: drive becoming ready, waiting up "
                      "to %dms", token, cdb[0],
                      LASER_BECOMING_READY_MAX_WALL_MS);
             }
-            if (monotonic_ms_since(&becoming_ready_since) <
+            if (monotonic_ms_now() - becoming_ready_since <
                 LASER_BECOMING_READY_MAX_WALL_MS) {
                 attempt--;
                 retry_delay(entry, idempotent);
@@ -1382,35 +1424,21 @@ laser_status_t laser_scsi_cdb(int token,
         reason_logged = 1;
     }
 
-    /* Normalise into the public contract: a status with a specific meaning
-     * to the caller is kept, everything else becomes LASER_ERR_IO.
-     *
-     * THIS LIST MUST GROW WITH EVERY NEW TERMINAL STATUS. One missing is
-     * silently flattened into LASER_ERR_IO while its own branch has already
-     * logged it correctly, so the log looks right while the caller gets
-     * something it cannot act on. */
-    if (result != LASER_OK &&
-        result != LASER_ERR_MEDIA_GONE &&
-        result != LASER_ERR_NO_DEVICE &&
-        result != LASER_ERR_REFUSED &&
-        result != LASER_ERR_SCRAMBLED &&
-        result != LASER_ERR_NO_KEY &&
-        result != LASER_ERR_REGION &&
-        result != LASER_ERR_CANCELLED) {
-        /* The non-idempotent path has logged its own reason. */
+    /* Every way out of the loop sets a status of laser.h, LASER_ERR_IO by
+     * default: the budget spent. Summed up here, unless a branch above has
+     * already said why - which the non-idempotent path always has. */
+    if (result == LASER_ERR_IO) {
         if (idempotent && !reason_logged) {
             LOGW("token=%d: cdb 0x%02x%s failed after %d attempt(s) "
                  "(last sense %02x/%02x/%02x)",
                  token, cdb[0], where, attempts_made,
                  last_sense_key, last_asc, last_ascq);
         }
-        result = LASER_ERR_IO;
-    }
 
-    /* The drive failed the command outright - not a refusal of one sector
-     * or key, answered at once: polls give it time to recover. */
-    if (result == LASER_ERR_IO)
+        /* The drive failed the command outright - not a refusal of one
+         * sector or key, answered at once: polls give it time to recover. */
         entry->last_failure_ms = monotonic_ms_now();
+    }
 
     pthread_mutex_unlock(&entry->io_lock);
     return result;
@@ -1911,15 +1939,6 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
  * The medium: events, tray lock, eject - see laser.h
  * ========================================================================= */
 
-/* GET EVENT STATUS NOTIFICATION, media class: the event codes in the low
- * nibble of the descriptor's first byte, the status bits in its second. */
-#define GESN_CLASS_MEDIA            4
-#define GESN_MEDIA_EJECT_REQUEST    1
-#define GESN_MEDIA_NEW              2
-#define GESN_MEDIA_REMOVAL          3
-#define GESN_MEDIA_CHANGED          4
-#define GESN_MEDIA_STATUS_TRAY_OPEN 0x01
-
 /* Takes io_lock for a poll, or fails at once - the poll skipped - if another
  * command holds it, or if a command failed an attempt less than
  * LASER_POLL_QUIET_MS ago. A poll only matters when the drive is idle, and
@@ -1961,15 +1980,8 @@ static int poll_lock(laser_entry_t *entry)
 static laser_status_t media_events(laser_entry_t *entry,
                                    laser_media_status_t *out)
 {
-    uint8_t cdb[10] = { 0 };
-    cdb[0] = 0x4a; /* GET EVENT STATUS NOTIFICATION */
-    cdb[1] = 0x01; /* Polled */
-    cdb[4] = 1 << GESN_CLASS_MEDIA;
-    cdb[8] = 0x08; /* header + media event descriptor */
-
-    uint8_t buf[8];
-    int actual_len = 0;
-    int rc = -1, csw_status = -1;
+    gesn_media_t g;
+    int rc = -1;
     uint8_t sense_key = 0xff, asc = 0, ascq = 0;
 
     /* A drive busy with another consumer's command is not polled: see
@@ -1977,17 +1989,9 @@ static laser_status_t media_events(laser_entry_t *entry,
     if (!poll_lock(entry))
         return LASER_ERR_IO;
     for (int attempt = 1; attempt <= 2; attempt++) {
-        memset(buf, 0, sizeof(buf));
-        actual_len = 0;
-        csw_status = -1;
-        sense_key = 0xff;
-        rc = laser_bot_send_locked(entry, cdb, sizeof(cdb), buf, sizeof(buf),
-                                   1, &actual_len, &csw_status);
+        rc = gesn_media_locked(entry, &g, &sense_key, &asc, &ascq);
         if (rc == 0 || rc == BOT_FAIL_NO_DEVICE ||
-            csw_status != USB_BOT_STATUS_FAIL)
-            break;
-        request_sense_locked(entry, &sense_key, &asc, &ascq);
-        if (sense_key != SCSI_SENSE_KEY_UNIT_ATTENTION)
+            sense_key != SCSI_SENSE_KEY_UNIT_ATTENTION)
             break;
     }
     pthread_mutex_unlock(&entry->io_lock);
@@ -2002,16 +2006,12 @@ static laser_status_t media_events(laser_entry_t *entry,
         return LASER_ERR_IO;
     }
 
-    if (actual_len < 8)
-        return LASER_ERR_IO;
-
-    /* NEA: no event of a class asked for is supported. */
-    if ((buf[2] & 0x80) != 0)
+    if (g.nea)
         return LASER_ERR_REFUSED;
-    if ((buf[2] & 0x07) != GESN_CLASS_MEDIA)
+    if (g.cls != GESN_CLASS_MEDIA)
         return LASER_ERR_IO;
 
-    switch (buf[4] & 0x0f) {
+    switch (g.event) {
     case GESN_MEDIA_EJECT_REQUEST:
         out->event = LASER_MEDIA_EJECT_REQUEST;
         break;
@@ -2026,13 +2026,13 @@ static laser_status_t media_events(laser_entry_t *entry,
         out->event = LASER_MEDIA_NO_EVENT;
         break;
     }
-    out->tray_open = (buf[5] & GESN_MEDIA_STATUS_TRAY_OPEN) != 0;
+    out->tray_open = g.tray_open;
     /* The "present" bit is not trusted: see laser_medium_t. */
     out->medium = LASER_MEDIUM_UNKNOWN;
 
     if (out->event != LASER_MEDIA_NO_EVENT)
         LOGI("token=%d: media event %d (raw %02x %02x), tray %s", entry->token,
-             (int)out->event, buf[4], buf[5],
+             (int)out->event, g.raw[2], g.raw[3],
              out->tray_open ? "open" : "closed");
     return LASER_OK;
 }
@@ -2046,10 +2046,8 @@ static laser_status_t media_from_unit_ready(laser_entry_t *entry,
     if (!poll_lock(entry))
         return LASER_ERR_IO;
 
-    int rc = test_unit_ready_locked(entry);
-    uint8_t sense_key = 0xff, asc = 0, ascq = 0;
-    if (rc != 0 && rc != BOT_FAIL_NO_DEVICE)
-        request_sense_locked(entry, &sense_key, &asc, &ascq);
+    uint8_t sense_key, asc, ascq;
+    int rc = test_unit_ready_locked(entry, &sense_key, &asc, &ascq);
 
     pthread_mutex_unlock(&entry->io_lock);
 
@@ -2057,24 +2055,31 @@ static laser_status_t media_from_unit_ready(laser_entry_t *entry,
         entry->device_gone = 1;
         return LASER_ERR_NO_DEVICE;
     }
-
     if (rc == 0) {
         out->medium = LASER_MEDIUM_PRESENT;
-    } else if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-               asc == SCSI_ASC_MEDIUM_NOT_PRESENT) {
-        out->medium = LASER_MEDIUM_ABSENT;
-        out->tray_open = ascq == SCSI_ASCQ_TRAY_OPEN;
-    } else if (sense_key == SCSI_SENSE_KEY_NOT_READY &&
-               asc == SCSI_ASC_BECOMING_READY) {
-        out->medium = LASER_MEDIUM_PRESENT;
-    } else if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
-               asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
-               ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) {
-        out->event = LASER_MEDIA_NEW;
-    } else if (sense_key == 0xff) {
-        return LASER_ERR_IO;
+        return LASER_OK;
     }
-    return LASER_OK;
+
+    switch (medium_sense(sense_key, asc, ascq)) {
+    case MEDIUM_SENSE_TRAY_OPEN:
+        out->tray_open = 1;
+        /* fall through */
+    case MEDIUM_SENSE_ABSENT:
+        out->medium = LASER_MEDIUM_ABSENT;
+        return LASER_OK;
+    case MEDIUM_SENSE_LOADING:
+        out->medium = LASER_MEDIUM_PRESENT;
+        return LASER_OK;
+    case MEDIUM_SENSE_OTHER:
+        break;
+    }
+    if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
+        asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+        ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) {
+        out->event = LASER_MEDIA_NEW;
+        return LASER_OK;
+    }
+    return sense_key == 0xff ? LASER_ERR_IO : LASER_OK;
 }
 
 laser_status_t laser_media_poll(int token, laser_media_status_t *out)
@@ -2111,11 +2116,11 @@ laser_status_t laser_media_poll(int token, laser_media_status_t *out)
      * it for as long as a consumer keeps the device registered, and turn the
      * new disc away unprobed; lowered, the next laser_token_settle() waits
      * for this one instead. */
-    if (st == LASER_OK && entry->not_ready &&
+    if (st == LASER_OK && entry->wait_state != LASER_WAIT_READY &&
         (out->event == LASER_MEDIA_NEW ||
          out->medium == LASER_MEDIUM_PRESENT)) {
         pthread_mutex_lock(&entry->io_lock);
-        entry->not_ready = 0;
+        entry->wait_state = LASER_WAIT_READY;
         pthread_mutex_unlock(&entry->io_lock);
         LOGI("token=%d: new medium, readiness to be checked again", token);
     }

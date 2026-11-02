@@ -168,7 +168,7 @@ laser_entry_t *laser_lookup(int token)
 int laser_token_not_ready(int token)
 {
     laser_entry_t *entry = laser_lookup(token);
-    return entry != NULL && entry->not_ready;
+    return entry != NULL && entry->wait_state != LASER_WAIT_READY;
 }
 
 /** Accessors of laser_entry_t::cancelled. The write takes the table lock so
@@ -268,13 +268,15 @@ static void reattach_kernel_driver(laser_entry_t *entry)
  * endpoints, claim, Mass Storage Reset, optical LUN, spin-up wait. Reachable
  * only from laser_acquire().
  *
+ * @return the entry, published; NULL if the device could not be set up.
+ *
  * Caller MUST hold g_registry_lock. */
-static int laser_register(int fd)
+static laser_entry_t *laser_register(int fd)
 {
     laser_entry_t *entry = reserve_slot(fd);
     if (entry == NULL) {
         LOGW("register(fd=%d): already registered, or table full", fd);
-        return -1;
+        return NULL;
     }
 
     /* Identity of the descriptor, for the recycling check in laser_acquire().
@@ -462,7 +464,7 @@ static int laser_register(int fd)
          "(iface=%u ep_in=0x%02x ep_out=0x%02x lun=%u)",
          fd, entry->vid, entry->pid, entry->bcd_device,
          entry->iface_num, entry->ep_in, entry->ep_out, entry->lun);
-    return 0;
+    return entry;
 
     /* Unwind ladder, in reverse order of acquisition. err_iface serves the
      * only failures after the claim: the declines above. */
@@ -483,7 +485,7 @@ static int laser_register(int fd)
     pthread_mutex_destroy(&entry->io_lock);
     err_slot:
     release_slot(entry);
-    return -1;
+    return NULL;
 }
 
 /** Serializes registration - including its slow USB setup, up to 30 seconds
@@ -711,10 +713,8 @@ laser_status_t laser_acquire(int token)
         return LASER_ERR_NO_SUCH_TOKEN;
     }
 
-    if (entry == NULL) {
-        laser_register(token);
-        entry = laser_lookup(token);
-    }
+    if (entry == NULL)
+        entry = laser_register(token);
 
     if (entry == NULL) {
         pthread_mutex_unlock(&g_registry_lock);

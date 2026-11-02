@@ -105,15 +105,6 @@ static uint32_t udf_size_cb(struct udfread_block_input *bi)
     return 0;
 }
 
-/* What one pass over the UDF filesystem found. */
-typedef enum {
-    UDF_DISC_NONE = 0,    /* no UDF, or UDF with no known layout on it */
-    UDF_DISC_DVD_VIDEO,   /* a Video zone and no Audio zone */
-    UDF_DISC_DVD_AUDIO,   /* an Audio zone and no Video zone */
-    UDF_DISC_DVD_UNIVERSAL,  /* both zones - a universal disc */
-    UDF_DISC_BD,
-} udf_disc_t;
-
 #define UDF_ZONE_MAGIC_LEN 12
 
 /** Is this DVD zone really there? The directory is not enough: many pressed
@@ -512,17 +503,19 @@ static void bdmt_read_title(udfread *udf, int token, const char *const *langs,
 }
 
 /** Mounts the medium's UDF filesystem once and answers every UDF question
- * from it, filling volume_id (LASER_DISC_VOLUME_ID_MAX bytes) when something
- * was recognised, and title (LASER_DISC_TITLE_MAX bytes) for a BD-Video. Mounting is the expensive part; each probe after it is a
- * path lookup, plus a 12-byte read where the lookup hits.
+ * from it: a DVD kind, BD-Video, or LASER_DISC_UNKNOWN for no UDF or none of
+ * those layouts on it. Fills volume_id (LASER_DISC_VOLUME_ID_MAX bytes) when
+ * something was recognised, and title (LASER_DISC_TITLE_MAX bytes) for a
+ * BD-Video. Mounting is the expensive part; each probe after it is a path
+ * lookup, plus a 12-byte read where the lookup hits.
  *
  * Order: the Video zone first, as the commonest. If present, the Audio zone
  * too, since a universal disc has both. If absent, BD-Video before the Audio
  * zone, so that a Blu-ray pays no lookup for a zone it cannot have. */
-static udf_disc_t detect_udf_disc(int token, const char *const *langs,
-                                  char *volume_id, char *title)
+static laser_disc_kind_t detect_udf_disc(int token, const char *const *langs,
+                                         char *volume_id, char *title)
 {
-    udf_disc_t kind = UDF_DISC_NONE;
+    laser_disc_kind_t kind = LASER_DISC_UNKNOWN;
 
     struct scsi_block_input sbi = {
             .base = { .close = NULL, .read = udf_read_cb, .size = udf_size_cb },
@@ -534,7 +527,7 @@ static udf_disc_t detect_udf_disc(int token, const char *const *langs,
     if (udf == NULL)
     {
         LOGW("token=%d: udfread_init() failed", token);
-        return UDF_DISC_NONE;
+        return LASER_DISC_UNKNOWN;
     }
 
     int udf_ret = udfread_open_input(udf, &sbi.base);
@@ -556,7 +549,7 @@ static udf_disc_t detect_udf_disc(int token, const char *const *langs,
                                               UDF_AUDIO_ZONE_MAGIC);
             LOGI("token=%d: %s: %s", token, UDF_AUDIO_ZONE_IFO,
                  has_audio ? "present" : "absent");
-            kind = has_audio ? UDF_DISC_DVD_UNIVERSAL : UDF_DISC_DVD_VIDEO;
+            kind = has_audio ? LASER_DISC_DVD_UNIVERSAL : LASER_DISC_DVD_VIDEO;
         }
         else
         {
@@ -565,7 +558,7 @@ static udf_disc_t detect_udf_disc(int token, const char *const *langs,
                  f != NULL ? "present" : "absent");
             if (f != NULL)
             {
-                kind = UDF_DISC_BD;
+                kind = LASER_DISC_BD_VIDEO;
                 udfread_file_close(f);
                 bdmt_read_title(udf, token, langs, title);
             }
@@ -576,11 +569,11 @@ static udf_disc_t detect_udf_disc(int token, const char *const *langs,
                 LOGI("token=%d: %s: %s", token, UDF_AUDIO_ZONE_IFO,
                      has_audio ? "present" : "absent");
                 if (has_audio)
-                    kind = UDF_DISC_DVD_AUDIO;
+                    kind = LASER_DISC_DVD_AUDIO;
             }
         }
 
-        if (kind != UDF_DISC_NONE)
+        if (kind != LASER_DISC_UNKNOWN)
         {
             const char *vol_id = udfread_get_volume_id(udf);
             if (vol_id != NULL)
@@ -659,24 +652,8 @@ static bool iso_name_matches(const uint8_t *name, unsigned name_len,
     if (semi != NULL)
         name_len = (unsigned)(semi - name);
 
-    if (name_len != strlen(want))
-        return false;
-
-    for (unsigned i = 0; i < name_len; i++)
-    {
-        int a = name[i];
-        int b = (unsigned char)want[i];
-
-        if (a >= 'a' && a <= 'z')
-            a -= 'a' - 'A';
-        if (b >= 'a' && b <= 'z')
-            b -= 'a' - 'A';
-
-        if (a != b)
-            return false;
-    }
-
-    return true;
+    return name_len == strlen(want) &&
+           strncasecmp((const char *)name, want, name_len) == 0;
 }
 
 /** Find one named child of the directory at (dir_lba, dir_len), filling
@@ -751,12 +728,6 @@ static bool iso_info_magic_is(const iso_ctx_t *ctx, uint32_t lba, const char *ma
     return memcmp(sector, magic, 8) == 0;
 }
 
-typedef enum {
-    ISO_VIDEO_NONE = 0,
-    ISO_VIDEO_VCD,
-    ISO_VIDEO_SVCD,
-} iso_video_t;
-
 /** Is this Volume Identifier printable ASCII? ECMA-119 allows only
  * d-characters, but many discs carry bytes in an unrecorded encoding, which
  * would reach the consumer as invalid UTF-8. Such a label is refused whole
@@ -772,20 +743,24 @@ static bool iso_volume_id_is_printable_ascii(const uint8_t *p, unsigned len)
     return true;
 }
 
-/** Walks the ISO9660 filesystem once for both Video CD kinds, filling
- * volume_id (LASER_DISC_VOLUME_ID_MAX bytes) when something was recognised.
- * VCD is tried first only because it is the commoner; a disc cannot be
- * both. */
-static iso_video_t detect_iso_video(const iso_ctx_t *ctx, char *volume_id)
+/** Walks the ISO9660 filesystem once for both Video CD kinds: LASER_DISC_VCD,
+ * LASER_DISC_SVCD, or LASER_DISC_UNKNOWN. Fills volume_id
+ * (LASER_DISC_VOLUME_ID_MAX bytes) when something was recognised. VCD is
+ * tried first only because it is the commoner; a disc cannot be both. */
+static laser_disc_kind_t detect_iso_video(int token, uint32_t track_lba,
+                                          char *volume_id)
 {
+    const iso_ctx_t iso = { .token = token, .base = track_lba };
+    const iso_ctx_t *ctx = &iso;
+
     uint8_t pvd[ISO_SECTOR_SIZE];
     if (!iso_read_sector(ctx, ctx->base + ISO_PVD_LBA, pvd))
-        return ISO_VIDEO_NONE;
+        return LASER_DISC_UNKNOWN;
 
     /* Type 1, the Primary Volume Descriptor, and the "CD001" identifier:
      * either alone matches too much. */
     if (pvd[0] != 0x01 || memcmp(pvd + 1, "CD001", 5) != 0)
-        return ISO_VIDEO_NONE;
+        return LASER_DISC_UNKNOWN;
 
     /* The root directory record, at offset 156 of the PVD. */
     const uint8_t *root = pvd + 156;
@@ -793,19 +768,19 @@ static iso_video_t detect_iso_video(const iso_ctx_t *ctx, char *volume_id)
     uint32_t root_len = iso_le32(root + ISO_DR_DATA_LEN_LE);
 
     if (root_len == 0)
-        return ISO_VIDEO_NONE;
+        return LASER_DISC_UNKNOWN;
 
     static const struct {
         const char *dir;
         const char *info;
         const char *magic;
-        iso_video_t kind;
+        laser_disc_kind_t kind;
     } probes[] = {
-        { "VCD",  "INFO.VCD", "VIDEO_CD", ISO_VIDEO_VCD  },
-        { "SVCD", "INFO.SVD", "SUPERVCD", ISO_VIDEO_SVCD },
+        { "VCD",  "INFO.VCD", "VIDEO_CD", LASER_DISC_VCD  },
+        { "SVCD", "INFO.SVD", "SUPERVCD", LASER_DISC_SVCD },
     };
 
-    iso_video_t kind = ISO_VIDEO_NONE;
+    laser_disc_kind_t kind = LASER_DISC_UNKNOWN;
 
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
     {
@@ -829,8 +804,8 @@ static iso_video_t detect_iso_video(const iso_ctx_t *ctx, char *volume_id)
         }
     }
 
-    if (kind == ISO_VIDEO_NONE)
-        return ISO_VIDEO_NONE;
+    if (kind == LASER_DISC_UNKNOWN)
+        return LASER_DISC_UNKNOWN;
 
     /* Volume Identifier: 32 bytes at offset 40, padded with spaces rather
      * than terminated. 32 bytes fit LASER_DISC_VOLUME_ID_MAX with its
@@ -1024,55 +999,6 @@ static const char *laser_disc_state_name(laser_disc_state_t state)
     return "no answer";
 }
 
-/* Each detector writes out->volume_id only when it recognises something, so
- * a miss leaves the empty label for the next one. */
-static bool identify_udf(int token, const char *const *langs,
-                         laser_disc_t *out)
-{
-    switch (detect_udf_disc(token, langs, out->volume_id, out->title))
-    {
-        case UDF_DISC_DVD_VIDEO:
-            out->kind = LASER_DISC_DVD_VIDEO;
-            return true;
-
-        case UDF_DISC_DVD_AUDIO:
-            out->kind = LASER_DISC_DVD_AUDIO;
-            return true;
-
-        case UDF_DISC_DVD_UNIVERSAL:
-            out->kind = LASER_DISC_DVD_UNIVERSAL;
-            return true;
-
-        case UDF_DISC_BD:
-            out->kind = LASER_DISC_BD_VIDEO;
-            return true;
-
-        case UDF_DISC_NONE:
-            break;
-    }
-    return false;
-}
-
-static bool identify_iso(int token, uint32_t track_lba, laser_disc_t *out)
-{
-    const iso_ctx_t ctx = { .token = token, .base = track_lba };
-
-    switch (detect_iso_video(&ctx, out->volume_id))
-    {
-        case ISO_VIDEO_VCD:
-            out->kind = LASER_DISC_VCD;
-            return true;
-
-        case ISO_VIDEO_SVCD:
-            out->kind = LASER_DISC_SVCD;
-            return true;
-
-        case ISO_VIDEO_NONE:
-            break;
-    }
-    return false;
-}
-
 void laser_disc_identify_lang(int token, const char *const *langs,
                               laser_disc_t *out)
 {
@@ -1089,7 +1015,7 @@ void laser_disc_identify_lang(int token, const char *const *langs,
      * each after a full retry budget. Why it is not ready - no medium, the
      * tray open, or no answer - is what its wait last found. */
     laser_entry_t *entry = laser_lookup(token);
-    if (entry == NULL || laser_token_not_ready(token)) {
+    if (entry == NULL || entry->wait_state != LASER_WAIT_READY) {
         switch (entry != NULL ? entry->wait_state : LASER_WAIT_NOT_READY) {
             case LASER_WAIT_NO_MEDIUM:
                 out->state = LASER_DISC_STATE_NO_MEDIUM;
@@ -1132,16 +1058,22 @@ void laser_disc_identify_lang(int token, const char *const *langs,
     /* On a known CD, the ISO9660 walk first: a Video CD is the likeliest
      * video disc there, and the walk is cheaper than a UDF mount. UDF still
      * follows, for a DVD-Video burned on a CD. On an unknown medium the
-     * order is reversed, DVDs being likelier. */
-    if (medium == MEDIUM_CD && toc == CD_TOC_DATA &&
-        identify_iso(token, track_lba, out))
-        goto done;
+     * order is reversed, DVDs being likelier. Each detector writes
+     * out->volume_id only when it recognises something, so a miss leaves the
+     * empty label for the next one. */
+    if (medium == MEDIUM_CD && toc == CD_TOC_DATA)
+    {
+        out->kind = detect_iso_video(token, track_lba, out->volume_id);
+        if (out->kind != LASER_DISC_UNKNOWN)
+            goto done;
+    }
 
-    if (identify_udf(token, langs, out))
+    out->kind = detect_udf_disc(token, langs, out->volume_id, out->title);
+    if (out->kind != LASER_DISC_UNKNOWN)
         goto done;
 
     if (medium == MEDIUM_UNKNOWN && toc == CD_TOC_DATA)
-        identify_iso(token, track_lba, out);
+        out->kind = detect_iso_video(token, track_lba, out->volume_id);
 
 done:
     LOGI("token=%d: identified as %s, volume id \"%s\", title \"%s\"", token,
