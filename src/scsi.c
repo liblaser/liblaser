@@ -464,6 +464,15 @@ void laser_allow_medium_removal(laser_entry_t *entry)
     uint8_t sense_key, asc, ascq;
     int rc = command_locked(entry, cdb, sizeof(cdb), NULL, 0, NULL,
                             &csw_status, &sense_key, &asc, &ascq);
+    /* 06h UNIT ATTENTION reports an event - the drive's power-on reset, as
+     * the first command it gets - not a refusal, and is cleared by being
+     * reported: the same request once more (see spin_up_locked()). */
+    if (rc != 0 && sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION) {
+        LOGI("token=%d: PREVENT ALLOW MEDIUM REMOVAL met a UNIT ATTENTION "
+             "(%02x/%02x), sending it again", entry->token, asc, ascq);
+        rc = command_locked(entry, cdb, sizeof(cdb), NULL, 0, NULL,
+                            &csw_status, &sense_key, &asc, &ascq);
+    }
 
     pthread_mutex_unlock(&entry->io_lock);
 
