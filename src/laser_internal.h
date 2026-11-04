@@ -109,7 +109,7 @@ typedef struct {
      * Starts at LASER_MAX_BYTES_PER_TRANSFER and only ever shrinks, never
      * below LASER_MIN_BYTES_PER_TRANSFER: lowered when smaller transfers read
      * the whole range a larger one failed on, which shows the limit to be the
-     * bridge's rather than the disc's (see read_chunked() in scsi.c). Kept
+     * bridge's rather than the disc's (see read_chunked() in read.c). Kept
      * here rather than in a consumer, so that every consumer of the token
      * benefits.
      *
@@ -134,7 +134,7 @@ typedef struct {
      * read starting in a run fails at once, and one reaching a run stops
      * short of it - for every consumer of the device, the disc's
      * identification, libdvdcss and each playback alike, until the disc
-     * changes. See read_chunked() in scsi.c.
+     * changes. See read_chunked() in read.c.
      *
      * Written and read under io_lock. */
     struct {
@@ -289,7 +289,7 @@ typedef struct {
 
     /* When a command last failed an attempt, on CLOCK_MONOTONIC in
      * milliseconds; 0 if none has. A media poll leaves the drive alone for
-     * a while after it (see poll_lock() in scsi.c). Written and read under
+     * a while after it (see poll_lock() in medium.c). Written and read under
      * io_lock. */
     int64_t         last_failure_ms;
 } laser_entry_t;
@@ -386,7 +386,7 @@ void laser_allow_medium_removal(laser_entry_t *entry);
  * Bounded in real time by LASER_SPINUP_MAX_WALL_MS (15 s), raised to
  * LASER_BECOMING_READY_MAX_WALL_MS (30 s) for a drive that says it is becoming
  * ready; it cannot be cancelled. A working drive returns within a few seconds,
- * or within the time it takes to load a disc just inserted. See scsi.c.
+ * or within the time it takes to load a disc just inserted. See ready.c.
  */
 void laser_wait_until_ready(laser_entry_t *entry);
 

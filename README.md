@@ -96,11 +96,12 @@ opened it.
 **One shared contrib, not per-module code.** `liblaser` owns the
 device registry (`registry.c`), the USB interface and endpoint discovery
 (`usb.c`), the Mass Storage Bulk-Only transport (`bot.c`), the SCSI command
-layer (`scsi.c`) and the identification of the disc in the drive (`disc.c`) —
-one file per concern.
+layer (`scsi.c`, with `ready.c`, `read.c` and `medium.c` beside it) and the
+identification of the disc in the drive (`disc.c`) — one file per concern.
 The VLC access module, libdvdcss, libdvdread/libdvdnav and the CD-Audio module
 all reach the drive through it. Retry policy, [LUN](#7-acronyms) selection, sense-code
-interpretation and error semantics exist once. libbluray is the one consumer
+interpretation, error semantics and the record of the blocks a disc will not
+give exist once. libbluray is the one consumer
 that needs none of it: it reads through the access module's stream.
 
 **Standards as the specification, hardware as the test.** Where a device could
@@ -172,20 +173,24 @@ which of the three paths above is taken:
 
 ```
   consumers, out of tree:  VLC access "laser" · cdrom.c · libdvdcss
-                              │  entering at disc.c, scsi.c or
-                              v  registry.c - see below
+                              │  entering at disc.c, the SCSI
+                              v  layer or registry.c - see below
  ┌────────────────┐   ┌────────────────┐
  │   registry.c   │   │     disc.c     │  what is in the drive:
  │                │   └────────────────┘  profile, TOC, ISO9660, UDF
  │  tokens and    │           │
  │  claims, CSS   │           v
  │  session,      │   ┌────────────────┐
- │  log sink      ├───┤     scsi.c     │  one CDB in, sense out:
- │                │   └────────────────┘  retries, spin-up, chunking
- │  owns the      │           │
- │  entry every   │           v
- │  box here      │   ┌────────────────┐
- │  reads         │   │     bot.c      │  one transaction:
+ │  log sink      ├───┤ read.c         │  chunked reads, bad blocks
+ │                │   │ medium.c       │  media poll, tray, region
+ │  owns the      │   │ ready.c        │  LUN probe, spin-up wait
+ │  entry every   │   ├────────────────┤
+ │  box here      │   │     scsi.c     │  one CDB in, sense out:
+ │  reads         │   └────────────────┘  retries
+ │                │           │
+ │                │           v
+ │                │   ┌────────────────┐
+ │                │   │     bot.c      │  one transaction:
  │                │   └────────────────┘  CBW → data → CSW
  │                │           │ reset only
  │                │           v
@@ -198,14 +203,24 @@ which of the three paths above is taken:
 ```
 
 **Read downwards and the vocabulary changes once per box.** `disc.c` speaks
-filesystems and knows no [CDB](#7-acronyms); `scsi.c` speaks CDBs and sense keys and knows no
+filesystems and knows no [CDB](#7-acronyms); the SCSI layer speaks CDBs and sense keys and knows no
 [CBW](#7-acronyms); `bot.c` speaks CBW, data, [CSW](#7-acronyms) and knows no sense code and no retry;
 `usb.c` speaks descriptors and endpoints and never builds a command at all.
+
+**The SCSI layer is four files around one primitive.** `scsi.c` holds what
+every command needs — sense classification, the retry policy of
+`laser_scsi_cdb()`, the abort check — and the three above it build on it:
+`ready.c` brings a drive up (the LUN probe at registration, the tray unlock,
+the bounded wait for the medium, again on `laser_token_settle()`), `read.c`
+cuts a read into transfers the bridge accepts and remembers the blocks that do
+not read, and `medium.c` answers about the disc in the tray: media poll, lock,
+eject, capacity, DVD region. What they share and nothing else needs — the
+sense codes, the commands below the retries — is in `scsi_internal.h`.
 
 **A consumer can enter the stack at three different heights**, which is why
 `laser.h` publishes read helpers and not just an identification call. The
 access module enters at the top for classification and in the middle for
-playback, taking sectors straight from `scsi.c`; `cdrom.c` enters in the middle
+playback, taking sectors straight from `read.c`; `cdrom.c` enters in the middle
 only, since a raw CD sector is a command and not a filesystem; libdvdcss enters
 at `registry.c` for the session bracket — `laser_acquire()` then
 `laser_css_session_begin()` in `dvdcss_open_common()`, unwound in both close
@@ -230,11 +245,11 @@ something the drawing above is missing.
 box reads the entry it owns. It is also the only thing that runs the stack out
 of order: registration is not a separate public call but the first
 `laser_acquire()` on an unknown token, which resolves the endpoints through
-`usb.c` and then probes the logical unit through `scsi.c`, skipping the two
+`usb.c` and then probes the logical unit through `ready.c`, skipping the two
 boxes in between. Everything after that goes down the stack normally.
 
-**Two edges do not point downwards, and both are deliberate.** `scsi.c` calls
-`laser_lookup()` on *every* command rather than holding the entry it was given,
+**Two edges do not point downwards, and both are deliberate.** The SCSI layer
+calls `laser_lookup()` on *every* command rather than holding the entry it was given,
 so that a device torn down between two commands is discovered at the next one
 instead of dereferenced. And `bot.c` calls `laser_mass_storage_reset()` in
 `usb.c` directly, for Reset Recovery: that request is a class request on the
@@ -270,10 +285,12 @@ only thing crossing from `bot.c` into `usb.c` is the reset.
   break address and the [PTP](#7-acronyms)/[OTP](#7-acronyms) direction of a dual-layer disc. Aligning
   windows so they do not straddle it would avoid a mechanical seek per
   crossing. With the drive idle 95% of the time, this is theoretical.
-- **Recovery of latched refusals after a successful authentication.** A sector
-  latched as scrambled before CSS engaged stays latched for the session. The
-  clean fix is a generation counter on the CSS session, sampled on each read.
-  Rarely reachable in practice, since authentication happens during open.
+- **Recovery of refusals recorded before a successful authentication.** A
+  block refused as scrambled three times before CSS engaged is answered
+  without the drive until the disc changes, or until the drive reports no key
+  (`LASER_ERR_NO_KEY`). Forgetting the refused blocks once an authentication
+  succeeds would close that gap. Rarely reachable in practice, since
+  authentication happens during open.
 - **Video CD in a later session.** The ISO9660 walk finds the PVD at sector 16
   of the first data track, whose start LBA comes from the table of contents
   already fetched, at no extra command; the extents in it are absolute, as

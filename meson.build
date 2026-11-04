@@ -5,7 +5,8 @@
 # and liblaser.pc.
 #
 # Layout:
-#   src/                - registry.c / usb.c / bot.c / scsi.c / disc.c and headers
+#   src/                - registry.c / usb.c / bot.c / disc.c, the SCSI layer
+#                         scsi.c / ready.c / read.c / medium.c, and headers
 #   contrib/libusb/     - vendored libusb 1.0.30, a complete upstream release
 #                         tree. Compiled here rather than through its own
 #                         configure; its Android config.h is the one upstream
@@ -17,7 +18,7 @@
 #   tools/confine.py    - the symbol confinement step, see below.
 
 project('liblaser', 'c',
-    version: '0.2.1',
+    version: '0.3.0',
     license: 'LGPL-2.1-or-later',
     meson_version: '>= 0.60.0',
     # GNU C11: _Static_assert in bot.c, and ##__VA_ARGS__ in LOG_QUIRK().
@@ -61,6 +62,9 @@ laser_public_symbols = [
     'laser_read_cd_blocks',
     'laser_status_is_positional',
     'laser_region_mismatch',
+    'laser_unreadable_blocks',
+    'laser_refused_for_good',
+    'laser_capacity',
     'laser_disc_identify',
     'laser_disc_identify_lang',
     'laser_media_poll',
@@ -126,6 +130,9 @@ laser_internal = static_library('laser-own',
         'src/usb.c',
         'src/bot.c',
         'src/scsi.c',
+        'src/ready.c',
+        'src/read.c',
+        'src/medium.c',
         'src/disc.c',
     ),
     include_directories: [laser_inc, libusb_inc, libudfread_inc],
