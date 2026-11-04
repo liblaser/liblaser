@@ -1628,34 +1628,189 @@ static void lower_transfer_cap(laser_entry_t *entry, int bytes,
     }
 }
 
-/* Before a chunk of @p *chunk blocks at @p lba: whether it starts in the
- * chunk the last read failed on - which this answer forgets - or else
- * shortened to stop before it. See laser_entry_t::failed_lba. */
-static int known_failed_chunk(laser_entry_t *entry, uint32_t lba, int *chunk)
+/* Before a chunk of @p *chunk blocks at @p lba, against the blocks the disc
+ * is known not to read: laser_entry_t::unreadable, and with @p refusals
+ * laser_entry_t::refused.
+ *
+ * Returns 0 if the chunk may go to the drive, shortened to stop before the
+ * first known block after @p lba - or to that one block, for a refusal not
+ * yet answered LASER_REFUSAL_MAX_HITS times, so that it is asked again and
+ * counted. Otherwise the status to answer without the drive: LASER_ERR_IO in
+ * an unreadable run, the refusal's status on a block refused that often. */
+static int known_bad_block(laser_entry_t *entry, uint32_t lba, int *chunk,
+                           int refusals)
 {
-    int known = 0;
+    int status = 0;
 
     pthread_mutex_lock(&entry->io_lock);
-    if (entry->failed_blocks > 0) {
-        const uint32_t bad = entry->failed_lba;
-        if (lba >= bad && lba - bad < (uint32_t)entry->failed_blocks) {
-            entry->failed_blocks = 0;
-            known = 1;
+    for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS && status == 0; i++) {
+        const uint32_t bad = entry->unreadable[i].lba;
+        const uint32_t count = entry->unreadable[i].count;
+        if (count == 0) {
+            continue;
+        }
+        if (lba >= bad && lba - bad < count) {
+            status = (int)LASER_ERR_IO;
+        } else if (bad > lba && bad - lba < (uint32_t)*chunk) {
+            *chunk = (int)(bad - lba);
+        }
+    }
+    for (unsigned i = 0; refusals && i < LASER_REFUSAL_SLOTS && status == 0;
+         i++) {
+        const uint32_t bad = entry->refused[i].lba;
+        if (entry->refused[i].hits == 0) {
+            continue;
+        }
+        if (bad == lba) {
+            if (entry->refused[i].hits >= LASER_REFUSAL_MAX_HITS) {
+                status = entry->refused[i].status;
+            } else {
+                *chunk = 1;
+            }
         } else if (bad > lba && bad - lba < (uint32_t)*chunk) {
             *chunk = (int)(bad - lba);
         }
     }
     pthread_mutex_unlock(&entry->io_lock);
-    return known;
+
+    return status;
 }
 
-static void remember_failed_chunk(laser_entry_t *entry, uint32_t lba,
-                                  int blocks)
+static void remember_unreadable(laser_entry_t *entry, int token, uint32_t lba,
+                                int count)
 {
     pthread_mutex_lock(&entry->io_lock);
-    entry->failed_lba = lba;
-    entry->failed_blocks = blocks;
+    entry->unreadable[entry->unreadable_next].lba = lba;
+    entry->unreadable[entry->unreadable_next].count = (uint32_t)count;
+    entry->unreadable_next = (entry->unreadable_next + 1) %
+                             LASER_UNREADABLE_SLOTS;
     pthread_mutex_unlock(&entry->io_lock);
+
+    LOGW("token=%d: LBA %u x %d unreadable, not asked for again until the "
+         "disc changes", token, lba, count);
+}
+
+/* A READ(10) of the single block @p lba was refused with @p status. Logged
+ * once per block. */
+static void remember_refusal(laser_entry_t *entry, int token, uint32_t lba,
+                             int status)
+{
+    pthread_mutex_lock(&entry->io_lock);
+    for (unsigned i = 0; i < LASER_REFUSAL_SLOTS; i++) {
+        if (entry->refused[i].hits > 0 && entry->refused[i].lba == lba) {
+            /* Saturating: a wrap would unlatch. */
+            if (entry->refused[i].hits < LASER_REFUSAL_MAX_HITS) {
+                entry->refused[i].hits++;
+            }
+            pthread_mutex_unlock(&entry->io_lock);
+            return;
+        }
+    }
+
+    /* The least-refused block makes way. */
+    unsigned slot = 0;
+    for (unsigned i = 1; i < LASER_REFUSAL_SLOTS; i++) {
+        if (entry->refused[slot].hits == 0) {
+            break;      /* an empty slot is as good as it gets */
+        }
+        if (entry->refused[i].hits < entry->refused[slot].hits) {
+            slot = i;
+        }
+    }
+    entry->refused[slot].lba = lba;
+    entry->refused[slot].status = status;
+    entry->refused[slot].hits = 1;
+    pthread_mutex_unlock(&entry->io_lock);
+
+    switch (status) {
+    case LASER_ERR_REGION:
+        LOGE("token=%d: this disc's region does not match the drive's. This "
+             "is NOT an authentication problem and no key exchange will fix "
+             "it.", token);
+        break;
+    case LASER_ERR_SCRAMBLED:
+        LOGW("token=%d: the drive refuses to read LBA %u - CSS-scrambled "
+             "content on a drive that has not been authenticated. Reads "
+             "elsewhere on the disc are unaffected.", token, lba);
+        break;
+    default:
+        LOGW("token=%d: the drive refuses to read LBA %u and will not explain "
+             "why (status %d). Reads elsewhere on the disc are unaffected.",
+             token, lba, status);
+        break;
+    }
+}
+
+static void forget_refusals(laser_entry_t *entry, int token, const char *why)
+{
+    int count = 0;
+
+    pthread_mutex_lock(&entry->io_lock);
+    for (unsigned i = 0; i < LASER_REFUSAL_SLOTS; i++) {
+        count += entry->refused[i].hits > 0;
+    }
+    memset(entry->refused, 0, sizeof(entry->refused));
+    pthread_mutex_unlock(&entry->io_lock);
+
+    if (count > 0) {
+        LOGI("token=%d: %s - forgetting %d refused block(s)", token, why,
+             count);
+    }
+}
+
+/* The disc changed, or left: what was known of its blocks goes with it. */
+static void forget_disc(laser_entry_t *entry, int token)
+{
+    pthread_mutex_lock(&entry->io_lock);
+    memset(entry->unreadable, 0, sizeof(entry->unreadable));
+    entry->unreadable_next = 0;
+    pthread_mutex_unlock(&entry->io_lock);
+
+    forget_refusals(entry, token, "the disc changed");
+}
+
+int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks)
+{
+    laser_entry_t *entry = laser_lookup(token);
+    if (entry == NULL || num_blocks <= 0) {
+        return 0;
+    }
+
+    int count = 0;
+    pthread_mutex_lock(&entry->io_lock);
+    for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS; i++) {
+        const uint32_t bad = entry->unreadable[i].lba;
+        const uint32_t run = entry->unreadable[i].count;
+        if (run != 0 && lba >= bad && lba - bad < run) {
+            const uint32_t left = run - (lba - bad);
+            count = left < (uint32_t)num_blocks ? (int)left : num_blocks;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&entry->io_lock);
+
+    return count;
+}
+
+int laser_refused_for_good(int token, uint32_t lba)
+{
+    laser_entry_t *entry = laser_lookup(token);
+    if (entry == NULL) {
+        return 0;
+    }
+
+    int latched = 0;
+    pthread_mutex_lock(&entry->io_lock);
+    for (unsigned i = 0; i < LASER_REFUSAL_SLOTS; i++) {
+        if (entry->refused[i].hits >= LASER_REFUSAL_MAX_HITS &&
+            entry->refused[i].lba == lba) {
+            latched = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&entry->io_lock);
+
+    return latched;
 }
 
 /* The body shared by laser_read_blocks() and laser_read_cd_blocks(): reads
@@ -1691,9 +1846,16 @@ static void remember_failed_chunk(laser_entry_t *entry, uint32_t lba,
  * This terminates: every retry is strictly smaller than the transfer that
  * failed, and none goes below LASER_MIN_BYTES_PER_TRANSFER.
  *
- * A FAILED CHUNK is remembered, once: the read asking for its blocks next -
- * this one's caller, after the short read - fails at once instead of
- * spending the retries again. See laser_entry_t::failed_lba.
+ * BLOCKS KNOWN NOT TO READ are not asked for again. A chunk failing with
+ * LASER_ERR_IO, its retries spent, is recorded unreadable for the device
+ * (laser_entry_t::unreadable): a read starting in it fails at once, and one
+ * reaching it stops short of it, as a short read. With @p refusals - READ(10)
+ * - a chunk refused with a positional status is read again at half the size
+ * down to the block refused, so that the blocks before it are returned, and
+ * that block is recorded (laser_entry_t::refused); a read reaching it stops
+ * short of it, and after LASER_REFUSAL_MAX_HITS refusals one starting on it
+ * gets the status without the drive. Both are forgotten when the disc
+ * changes, the refusals also when the drive reports no CSS session.
  *
  * @param token      registry token; the caller must hold a claim on it
  * @param lba        first block to read
@@ -1705,11 +1867,13 @@ static void remember_failed_chunk(laser_entry_t *entry, uint32_t lba,
  * @param ctx        handed to @p build_cdb untouched
  * @param buffer     at least @p num_blocks * @p block_size bytes
  * @param what       what to call these in a log line ("blocks", "sectors")
+ * @param refusals   whether refusals are narrowed down and recorded: for
+ *                   READ(10), the 2048-byte blocks of DVDs and BDs
  */
 static int read_chunked(int token, uint32_t lba, int num_blocks,
                         int block_size, int cdb_len,
                         build_read_cdb_fn build_cdb, const void *ctx,
-                        uint8_t *buffer, const char *what)
+                        uint8_t *buffer, const char *what, int refusals)
 {
     if (num_blocks <= 0) {
         return 0;
@@ -1727,6 +1891,10 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
     int trial_end = 0;
     int trial_failed = 0;
 
+    /* The size a refusal was narrowed down to, 0 when none: the blocks
+     * before the refused one are read in such chunks, for this read only. */
+    int refusal_cap = 0;
+
     while (blocks_done < num_blocks) {
         /* Re-read every time round: another thread on the same drive may
          * have lowered it. */
@@ -1734,6 +1902,9 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
                                 : LASER_MAX_BYTES_PER_TRANSFER;
         if (trial_cap > 0 && trial_cap < cap) {
             cap = trial_cap;
+        }
+        if (refusal_cap > 0 && refusal_cap < cap) {
+            cap = refusal_cap;
         }
 
         int max_blocks_per_chunk = cap / block_size;
@@ -1747,13 +1918,14 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
             chunk = max_blocks_per_chunk;
         }
 
-        /* The blocks the last read failed on, asked for again at once: they
-         * fail now, without the drive. */
-        if (entry != NULL &&
-            known_failed_chunk(entry, lba + (uint32_t)blocks_done, &chunk)) {
-            LOGI("token=%d: LBA %u failed the last read, not tried again "
-                 "at once", token, lba + (uint32_t)blocks_done);
-            return blocks_done > 0 ? blocks_done : (int)LASER_ERR_IO;
+        /* Blocks known not to read: answered without the drive. */
+        if (entry != NULL) {
+            const int known = known_bad_block(entry,
+                                              lba + (uint32_t)blocks_done,
+                                              &chunk, refusals);
+            if (known != 0) {
+                return blocks_done > 0 ? blocks_done : known;
+            }
         }
 
         uint8_t cdb[16];
@@ -1769,7 +1941,30 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
         if (st != LASER_OK) {
             if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
                 st == LASER_ERR_CANCELLED) {
+                if (st == LASER_ERR_MEDIA_GONE && entry != NULL) {
+                    forget_disc(entry, token);
+                }
                 return (int)st;
+            }
+
+            /* A refusal fails the whole command: narrowed down to the
+             * refused block, so that the blocks before it are returned. */
+            if (refusals && laser_status_is_positional(st) &&
+                entry != NULL) {
+                if (chunk > 1) {
+                    refusal_cap = (chunk / 2) * block_size;
+                    continue;
+                }
+                remember_refusal(entry, token, lba + (uint32_t)blocks_done,
+                                 (int)st);
+                return blocks_done > 0 ? blocks_done : (int)st;
+            }
+
+            /* No CSS session in force: no block is to blame, and those
+             * refused may read once libdvdcss authenticates again. */
+            if (st == LASER_ERR_NO_KEY && entry != NULL) {
+                forget_refusals(entry, token,
+                                "the drive reports no CSS session in force");
             }
 
             /* Maybe the bridge rather than the disc: try the same blocks at
@@ -1792,8 +1987,8 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
             }
 
             if (st == LASER_ERR_IO && entry != NULL) {
-                remember_failed_chunk(entry, lba + (uint32_t)blocks_done,
-                                      chunk);
+                remember_unreadable(entry, token, lba + (uint32_t)blocks_done,
+                                    chunk);
             }
             return blocks_done > 0 ? blocks_done : (int)st;
         }
@@ -1849,7 +2044,7 @@ int laser_read_blocks(int token, uint32_t lba, int num_blocks,
                       uint8_t *buffer)
 {
     return read_chunked(token, lba, num_blocks, 2048, 10,
-                        build_read10_cdb, NULL, buffer, "blocks");
+                        build_read10_cdb, NULL, buffer, "blocks", 1);
 }
 
 /* Bytes 1 and 9 of READ CD, resolved from the sector kind before the loop
@@ -1941,7 +2136,7 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
     };
 
     return read_chunked(token, lba, num_blocks, block_size, 12,
-                        build_read_cd_cdb, &ctx, buffer, "sectors");
+                        build_read_cd_cdb, &ctx, buffer, "sectors", 0);
 }
 
 /* ============================================================================
@@ -2120,6 +2315,10 @@ laser_status_t laser_media_poll(int token, laser_media_status_t *out)
     if (st == LASER_ERR_REFUSED)
         st = media_from_unit_ready(entry, out);
 
+    /* Another disc: the blocks known not to read were the last one's. */
+    if (st == LASER_OK && out->event == LASER_MEDIA_NEW)
+        forget_disc(entry, token);
+
     /* A new medium: the registration's wait answered for the one before, or
      * for an empty drive. Its "never became ready" would otherwise outlive
      * it for as long as a consumer keeps the device registered, and turn the
@@ -2147,6 +2346,54 @@ laser_status_t laser_media_lock(int token, int locked)
     LOGI("token=%d: tray %s -> %d", token, locked ? "lock" : "unlock",
          (int)st);
     return st;
+}
+
+laser_status_t laser_capacity(int token, uint32_t *num_blocks)
+{
+    if (num_blocks == NULL) {
+        LOGE("token=%d: laser_capacity() with no place for the answer",
+             token);
+        return LASER_ERR_INVALID;
+    }
+
+    uint8_t cdb[10] = { 0 };
+    cdb[0] = 0x25;  /* READ CAPACITY(10) */
+
+    uint8_t data[8] = { 0 };
+    int actual = 0;
+    laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb), data,
+                                       sizeof(data), 1, &actual);
+    if (st != LASER_OK) {
+        LOGW("token=%d: READ CAPACITY failed (status %d)", token, (int)st);
+        return st;
+    }
+    if (actual < (int)sizeof(data)) {
+        LOGW("token=%d: READ CAPACITY answered %d of %d bytes", token, actual,
+             (int)sizeof(data));
+        return LASER_ERR_IO;
+    }
+
+    const uint32_t last_lba = ((uint32_t)data[0] << 24) |
+                              ((uint32_t)data[1] << 16) |
+                              ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+    const uint32_t block_size = ((uint32_t)data[4] << 24) |
+                                ((uint32_t)data[5] << 16) |
+                                ((uint32_t)data[6] << 8) | (uint32_t)data[7];
+
+    /* READ CAPACITY(10)'s overflow sentinel: implausible on optical media. */
+    if (last_lba == 0xFFFFFFFFu) {
+        LOGW("token=%d: READ CAPACITY reports the 32-bit overflow sentinel",
+             token);
+        return LASER_ERR_IO;
+    }
+    if (block_size != 2048) {
+        LOGW("token=%d: READ CAPACITY reports %u-byte blocks, expected 2048",
+             token, block_size);
+        return LASER_ERR_IO;
+    }
+
+    *num_blocks = last_lba + 1;
+    return LASER_OK;
 }
 
 laser_status_t laser_media_eject(int token)

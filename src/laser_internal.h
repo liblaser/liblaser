@@ -74,6 +74,16 @@ void laser_log(laser_log_level_t level, const char *fmt, ...)
  * cap, which matters for READ CD, where this is only three sectors. */
 #define LASER_MIN_BYTES_PER_TRANSFER  (8 * 1024)
 
+/* Runs of blocks a disc could not be read in, kept per device: see
+ * laser_entry_t::unreadable. The oldest run makes way for a new one. */
+#define LASER_UNREADABLE_SLOTS 16
+
+/* Blocks a drive refused to read, kept per device, and how many refusals of
+ * one block it takes for a read there to be answered without the drive: see
+ * laser_entry_t::refused. */
+#define LASER_REFUSAL_SLOTS 16
+#define LASER_REFUSAL_MAX_HITS 3
+
 /** Per-device state for USB Mass Storage Bulk-Only Transport (BOT); the
  * protocol itself is in bot.c. */
 typedef struct {
@@ -116,17 +126,38 @@ typedef struct {
      * io_lock, read without it: a stale read negotiates once for nothing. */
     int largest_ok_bytes;
 
-    /* The chunk a read last failed on, its retries spent: its first block
-     * and block count, 0 blocks when none. A read failing after some chunks
-     * went through returns what it read, and its caller asks next for the
-     * very block that failed: that request fails at once rather than spend
-     * the retries again - over ten seconds on a drive stuck on a sector.
-     * Once only: the request it fails clears it, so a later read tries the
-     * drive again. See read_chunked() in scsi.c.
+    /* Runs of blocks the disc could not be read in - a read failing with
+     * LASER_ERR_IO, its retries spent: their first block and count, 0 blocks
+     * for an empty slot, and the slot the next run takes. Each attempt costs
+     * a drive stuck on them seconds, over ten behind a stalling bridge, and
+     * some protections put such blocks on purpose where no title plays. So a
+     * read starting in a run fails at once, and one reaching a run stops
+     * short of it - for every consumer of the device, the disc's
+     * identification, libdvdcss and each playback alike, until the disc
+     * changes. See read_chunked() in scsi.c.
      *
      * Written and read under io_lock. */
-    uint32_t failed_lba;
-    int      failed_blocks;
+    struct {
+        uint32_t lba;
+        uint32_t count;
+    } unreadable[LASER_UNREADABLE_SLOTS];
+    unsigned unreadable_next;
+
+    /* Single blocks a READ(10) was refused on - a positional status, see
+     * laser_status_is_positional() - with the status, and how many times:
+     * 0 hits for an empty slot. A read reaching one stops short of it; one
+     * starting on it goes to the drive until LASER_REFUSAL_MAX_HITS
+     * refusals, and is then answered with the status, without the drive.
+     * Forgotten when the disc changes, and when the drive says no CSS
+     * session is in force: once authenticated again, the scrambled blocks
+     * read. See read_chunked().
+     *
+     * Written and read under io_lock. */
+    struct {
+        uint32_t lba;
+        int      status;
+        unsigned hits;
+    } refused[LASER_REFUSAL_SLOTS];
 
     /* Raised by the laser_release() that drops the last claim, just before
      * teardown, and never cleared; the slot is memset afterwards. An

@@ -475,9 +475,45 @@ void laser_css_session_end(int token, const void *owner);
  *
  *         On a negative return, whatever was already written into
  *         `buffer` is undefined and must not be used.
+ *
+ * BLOCKS KNOWN NOT TO READ ARE NOT ASKED FOR AGAIN, by any consumer of the
+ * token, until the disc changes:
+ *   - a range the disc could not be read in, LASER_ERR_IO with its retries
+ *     spent: a read starting in it fails with LASER_ERR_IO at once, and one
+ *     reaching it is a short read stopping before it.
+ *     laser_unreadable_blocks() says how far the range goes;
+ *   - a block the drive refused, with a positional status: a refused command
+ *     is read again in smaller ones down to that block, so that the blocks
+ *     before it come back as a short read. A read reaching it stops before
+ *     it; one starting on it goes to the drive until the block has been
+ *     refused three times, and then gets the status without the drive -
+ *     see laser_refused_for_good(). These are also
+ *     forgotten when the drive reports no CSS session (LASER_ERR_NO_KEY).
  */
 int laser_read_blocks(int token, uint32_t lba, int num_blocks,
                       uint8_t *buffer);
+
+/**
+ * How many blocks from @p lba, at most @p num_blocks, the disc is known not
+ * to read: laser_read_blocks() or laser_read_cd_blocks() failed on them with
+ * LASER_ERR_IO, and fails at once on them now. 0 if @p lba is not among them,
+ * or the token is not registered.
+ *
+ * For a caller that reads such blocks as zeros rather than fail: after a
+ * LASER_ERR_IO, the blocks to fill.
+ */
+int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks);
+
+/**
+ * Whether the drive has refused the block @p lba often enough that
+ * laser_read_blocks() now answers a read starting on it with the refusal,
+ * without the drive: 1 if so, 0 otherwise, or if the token is not
+ * registered.
+ *
+ * For a caller that must stop asking: VLC's cache_read filter retries a
+ * failed read for as long as the input runs.
+ */
+int laser_refused_for_good(int token, uint32_t lba);
 
 /**
  * What kind of CD sector laser_read_cd_blocks() should ask the drive for.
@@ -648,6 +684,17 @@ laser_status_t laser_media_lock(int token, int locked);
  * Refused while the tray is locked.
  */
 laser_status_t laser_media_eject(int token);
+
+/**
+ * The medium's size in 2048-byte blocks: READ CAPACITY(10).
+ *
+ * @param num_blocks Set on success: the last block's address plus one.
+ * @return LASER_OK, or a laser_status_t. LASER_ERR_IO also for an answer
+ *         that cannot be right for an optical disc: too short, the 32-bit
+ *         overflow sentinel, or blocks other than 2048 bytes. Every failure
+ *         is logged.
+ */
+laser_status_t laser_capacity(int token, uint32_t *num_blocks);
 
 /* ============================================================================
  * Classifying a result
