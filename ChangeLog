@@ -1,6 +1,9 @@
-2026-XX-XX: version 0.3.1
+2026-11-05: version 0.3.1
+    - Move the public headers to include/
+    - Split scsi.c into scsi.c, ready.c, read.c and medium.c
+    - Remember the unreadable and refused blocks per device
     - Report the reason why no disc was identified
-    - Bug fixes
+    - Optimizations
 
 2026-10-28: version 0.3
     - Report Blu-ray title from the disc's library metadata
