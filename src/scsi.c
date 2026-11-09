@@ -305,10 +305,14 @@ laser_status_t laser_scsi_cdb_read(int token,
                                    const uint8_t *cdb, int cdb_len,
                                    uint8_t *data, int data_len,
                                    int data_in, int *actual_len,
-                                   int max_medium_errors, int *medium_error)
+                                   int max_medium_errors,
+                                   laser_failure_t *why)
 {
-    if (medium_error != NULL) {
-        *medium_error = 0;
+    if (why != NULL) {
+        why->medium_error = 0;
+        why->sense_key = 0xff;
+        why->asc = 0;
+        why->ascq = 0;
     }
 
     /* Caller bugs, caught here because their symptoms appear far from the
@@ -591,8 +595,8 @@ laser_status_t laser_scsi_cdb_read(int token,
                  token, cdb[0], where, medium_errors, sense_key, asc, ascq);
             reason_logged = 1;
             result = LASER_ERR_IO;
-            if (medium_error != NULL) {
-                *medium_error = 1;
+            if (why != NULL) {
+                why->medium_error = 1;
             }
             break;
         }
@@ -684,6 +688,12 @@ laser_status_t laser_scsi_cdb_read(int token,
         /* The drive failed the command outright - not a refusal of one
          * sector or key, answered at once: polls give it time to recover. */
         entry->last_failure_ms = laser_monotonic_ms_now();
+    }
+
+    if (why != NULL) {
+        why->sense_key = last_sense_key;
+        why->asc = last_asc;
+        why->ascq = last_ascq;
     }
 
     pthread_mutex_unlock(&entry->io_lock);

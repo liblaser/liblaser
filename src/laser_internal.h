@@ -117,6 +117,13 @@ typedef struct {
      * read asks for too much once and fails over to the same negotiation. */
     int max_transfer_bytes;
 
+    /* Set once the drive has refused a READ CD of audio sectors declared as
+     * CD-DA, as malformed: such reads then declare "any type", which it
+     * takes. See laser_read_cd_blocks() in read.c. Only goes from 0 to 1,
+     * read and written without a lock: a stale read costs one more
+     * refusal. */
+    int cdda_any_type;
+
     /* Largest read, in bytes, this device has completed in one command: a
      * failed transfer no larger than that cannot be the bridge's limit, and
      * read_chunked() does not negotiate over it - the halved read would fail

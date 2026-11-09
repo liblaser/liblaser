@@ -158,17 +158,29 @@ typedef struct {
 
 /* scsi.c */
 
+/* Why a command failed, as far as the drive said: for a caller that reacts
+ * to one answer differently from the others. */
+typedef struct {
+    /* The LASER_ERR_IO returned is the drive answering MEDIUM ERROR: it
+     * reached the sector and could not read it - not a drive that did not
+     * answer, nor a transport failure. */
+    int     medium_error;
+    /* The last sense REQUEST SENSE read, 0xff/00/00 if none was. */
+    uint8_t sense_key;
+    uint8_t asc;
+    uint8_t ascq;
+} laser_failure_t;
+
 /* laser_scsi_cdb(), giving up on a read after @p max_medium_errors attempts
  * the drive answered with a medium error rather than
- * LASER_READ_MAX_MEDIUM_ERRORS - 1 for once - and saying, through
- * @p medium_error if not NULL, whether the LASER_ERR_IO it returns is such
- * an answer: the drive reached the sector and could not read it, as opposed
- * to a drive that did not answer, or a transport failure. */
+ * LASER_READ_MAX_MEDIUM_ERRORS - 1 for once - and saying why it failed
+ * through @p why, if not NULL. */
 laser_status_t laser_scsi_cdb_read(int token,
                                    const uint8_t *cdb, int cdb_len,
                                    uint8_t *data, int data_len,
                                    int data_in, int *actual_len,
-                                   int max_medium_errors, int *medium_error);
+                                   int max_medium_errors,
+                                   laser_failure_t *why);
 
 /* One command, without the retries of laser_scsi_cdb(), and why it failed:
  * when its CSW says FAIL, the sense REQUEST SENSE reads, into @p sense_key,

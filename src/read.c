@@ -339,11 +339,15 @@ int laser_refused_for_good(int token, uint32_t lba)
  * @param what       what to call these in a log line ("blocks", "sectors")
  * @param refusals   whether refusals are narrowed down and recorded: for
  *                   READ(10), the 2048-byte blocks of DVDs and BDs
+ * @param invalid_field optional, may be NULL: set to 1 when a chunk was
+ *                   refused as malformed - ILLEGAL REQUEST, INVALID FIELD IN
+ *                   CDB - and left alone otherwise
  */
 static int read_chunked(int token, uint32_t lba, int num_blocks,
                         int block_size, int cdb_len,
                         build_read_cdb_fn build_cdb, const void *ctx,
-                        uint8_t *buffer, const char *what, int refusals)
+                        uint8_t *buffer, const char *what, int refusals,
+                        int *invalid_field)
 {
     if (num_blocks <= 0) {
         return 0;
@@ -411,15 +415,21 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
         build_cdb(cdb, lba + (uint32_t)blocks_done, chunk, ctx);
 
         int actual_len = 0;
-        int medium_error = 0;
+        laser_failure_t why;
         laser_status_t st = laser_scsi_cdb_read(
                 token, cdb, cdb_len,
                 buffer + (size_t)blocks_done * block_size,
                 chunk * block_size, /* data_in = */ 1, &actual_len,
                 medium_cap > 0 ? 1 : LASER_READ_MAX_MEDIUM_ERRORS,
-                &medium_error);
+                &why);
 
         if (st != LASER_OK) {
+            if (st == LASER_ERR_REFUSED && invalid_field != NULL &&
+                why.sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST &&
+                why.asc == SCSI_ASC_INVALID_CDB_FIELD) {
+                *invalid_field = 1;
+            }
+
             if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
                 st == LASER_ERR_CANCELLED) {
                 if (st == LASER_ERR_MEDIA_GONE && entry != NULL) {
@@ -452,7 +462,7 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
              * same blocks at half the size, so that those before the bad
              * ones are returned - see "a medium error is narrowed down"
              * above. The bridge is not to blame: it carried the answer. */
-            if (st == LASER_ERR_IO && medium_error && entry != NULL) {
+            if (st == LASER_ERR_IO && why.medium_error && entry != NULL) {
                 const int64_t now = laser_monotonic_ms_now();
                 if (medium_since == 0) {
                     medium_since = now;
@@ -544,7 +554,7 @@ int laser_read_blocks(int token, uint32_t lba, int num_blocks,
                       uint8_t *buffer)
 {
     return read_chunked(token, lba, num_blocks, 2048, 10,
-                        build_read10_cdb, NULL, buffer, "blocks", 1);
+                        build_read10_cdb, NULL, buffer, "blocks", 1, NULL);
 }
 
 /* Bytes 1 and 9 of READ CD, resolved from the sector kind before the loop
@@ -583,9 +593,13 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
      *   AUDIO: Expected Sector Type CD-DA (001b), User Data only. A CD-DA
      *     sector has no sync, header or EDC/ECC - its 2352 bytes are the
      *     user data - and a drive may refuse a request for them with INVALID
-     *     FIELD IN CDB, as some do. This is the form CD-DA extractors use. If
-     *     a drive ever refuses it, try type "any" (0x00) with User Data only
-     *     (0x10).
+     *     FIELD IN CDB, as some do. This is the form CD-DA extractors use.
+     *     A drive refusing it as malformed - INVALID FIELD IN CDB - is asked
+     *     again with type "any" (000b), still User Data only, which reads
+     *     the same 2352 bytes from an audio sector; and so from then on
+     *     (laser_entry_t::cdda_any_type). Not on any other refusal: ILLEGAL
+     *     MODE FOR THIS TRACK says the sectors are not audio, and "any"
+     *     would read them as if they were.
      *
      *   MODE2_FORM2 and ANY: sync, headers, user data and EDC/ECC (0xF8),
      *     which a Mode 2 sector does have; they differ only in the expected
@@ -630,11 +644,31 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
             return (int)LASER_ERR_INVALID;
     }
 
+    laser_entry_t *entry = laser_lookup(token);
+    const int audio = sector_type == LASER_CD_SECTOR_AUDIO;
+    if (audio && entry != NULL && entry->cdda_any_type) {
+        expected_type = 0x00;
+    }
+
     read_cd_ctx_t ctx = {
         .expected_type = expected_type,
         .field_flags   = field_flags,
     };
 
-    return read_chunked(token, lba, num_blocks, block_size, 12,
-                        build_read_cd_cdb, &ctx, buffer, "sectors", 0);
+    int invalid_field = 0;
+    int r = read_chunked(token, lba, num_blocks, block_size, 12,
+                         build_read_cd_cdb, &ctx, buffer, "sectors", 0,
+                         &invalid_field);
+
+    if (r == (int)LASER_ERR_REFUSED && invalid_field && audio &&
+        ctx.expected_type != 0x00 && entry != NULL) {
+        LOG_QUIRK(entry, "READ CD of CD-DA sectors refused as malformed, "
+                         "declaring them of any type from now on");
+        entry->cdda_any_type = 1;
+        ctx.expected_type = 0x00;
+        r = read_chunked(token, lba, num_blocks, block_size, 12,
+                         build_read_cd_cdb, &ctx, buffer, "sectors", 0, NULL);
+    }
+
+    return r;
 }
