@@ -37,6 +37,14 @@
  * Public: LBA-aware chunked block reads
  * ============================================================================ */
 
+/* A chunk the drive answered with a medium error is narrowed down to the
+ * blocks that do not read - see read_chunked() - down to this many blocks,
+ * and for this long at most from the first failure: a bridge stalling
+ * seconds on each medium error would otherwise turn a scratch into half a
+ * minute of halving. */
+#define LASER_MEDIUM_NARROW_MIN_BLOCKS 4
+#define LASER_MEDIUM_NARROW_MAX_MS     5000
+
 /* Build the CDB for one chunk - the only thing the two public helpers below
  * do differently. */
 typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
@@ -309,6 +317,16 @@ int laser_refused_for_good(int token, uint32_t lba)
  * gets the status without the drive. Both are forgotten when the disc
  * changes, the refusals also when the drive reports no CSS session.
  *
+ * A MEDIUM ERROR IS NARROWED DOWN. A chunk the drive answered with a medium
+ * error - it reached the sector and could not read it - is read again at
+ * half the size, each smaller read tried once, so that only the blocks that
+ * do not read are recorded and lost, not a whole chunk: a fraction of a
+ * second of silence on a scratched CD rather than a third of a second, a
+ * glitch in a film rather than a whole read-ahead window. Down to
+ * LASER_MEDIUM_NARROW_MIN_BLOCKS blocks, for LASER_MEDIUM_NARROW_MAX_MS at
+ * most, and never after a drive that did not answer at all: a protection's
+ * unreadable sectors are those, each costing the drive a timeout.
+ *
  * @param token      registry token; the caller must hold a claim on it
  * @param lba        first block to read
  * @param num_blocks how many to read; <= 0 reads nothing and succeeds
@@ -347,6 +365,11 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
      * before the refused one are read in such chunks, for this read only. */
     int refusal_cap = 0;
 
+    /* Likewise for a medium error, and when it was first answered, 0 when
+     * none has been. */
+    int medium_cap = 0;
+    int64_t medium_since = 0;
+
     while (blocks_done < num_blocks) {
         /* Re-read every time round: another thread on the same drive may
          * have lowered it. */
@@ -357,6 +380,9 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
         }
         if (refusal_cap > 0 && refusal_cap < cap) {
             cap = refusal_cap;
+        }
+        if (medium_cap > 0 && medium_cap < cap) {
+            cap = medium_cap;
         }
 
         int max_blocks_per_chunk = cap / block_size;
@@ -385,10 +411,13 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
         build_cdb(cdb, lba + (uint32_t)blocks_done, chunk, ctx);
 
         int actual_len = 0;
-        laser_status_t st = laser_scsi_cdb(
+        int medium_error = 0;
+        laser_status_t st = laser_scsi_cdb_read(
                 token, cdb, cdb_len,
                 buffer + (size_t)blocks_done * block_size,
-                chunk * block_size, /* data_in = */ 1, &actual_len);
+                chunk * block_size, /* data_in = */ 1, &actual_len,
+                medium_cap > 0 ? 1 : LASER_READ_MAX_MEDIUM_ERRORS,
+                &medium_error);
 
         if (st != LASER_OK) {
             if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
@@ -417,6 +446,25 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
             if (st == LASER_ERR_NO_KEY && entry != NULL) {
                 forget_refusals(entry, token,
                                 "the drive reports no CSS session in force");
+            }
+
+            /* The drive reached the blocks and could not read them: the
+             * same blocks at half the size, so that those before the bad
+             * ones are returned - see "a medium error is narrowed down"
+             * above. The bridge is not to blame: it carried the answer. */
+            if (st == LASER_ERR_IO && medium_error && entry != NULL) {
+                const int64_t now = laser_monotonic_ms_now();
+                if (medium_since == 0) {
+                    medium_since = now;
+                }
+                if (chunk > LASER_MEDIUM_NARROW_MIN_BLOCKS &&
+                    now - medium_since < LASER_MEDIUM_NARROW_MAX_MS) {
+                    medium_cap = (chunk / 2) * block_size;
+                    continue;
+                }
+                remember_unreadable(entry, token,
+                                    lba + (uint32_t)blocks_done, chunk);
+                return blocks_done > 0 ? blocks_done : (int)st;
             }
 
             /* Maybe the bridge rather than the disc: try the same blocks at

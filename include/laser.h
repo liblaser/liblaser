@@ -448,6 +448,15 @@ void laser_css_session_end(int token, const void *owner);
  *
  * So the first read on a weak bridge is slower than the next ones, and an
  * unreadable sector costs a few extra commands before it is reported.
+ *
+ * A MEDIUM ERROR IS NARROWED DOWN THE SAME WAY. When the drive answers that
+ * it could not read a sector - its own retries spent, as on a scratch - the
+ * chunk is read again at half the size, down to four blocks and for five
+ * seconds at most, so that the blocks before the bad ones come back as a
+ * short read and only a few are recorded as unreadable, not the whole
+ * chunk. Not when the drive did not answer at all, as on the unreadable
+ * sectors some protections put on purpose, where each attempt costs a
+ * timeout.
  * ============================================================================ */
 
 /**

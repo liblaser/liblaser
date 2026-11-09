@@ -57,13 +57,6 @@
  * turned one sector into half a minute. */
 #define LASER_READ_MAX_RESETS   2
 
-/* A read the drive answered with a medium error is tried twice, not
- * LASER_MAX_RETRIES times: the drive has already retried the sector itself,
- * and a disc it reads poorly - read fine by another drive - fails one
- * attempt in several. A JMicron bridge stalls three seconds on each, and
- * the full budget made a few such sectors outlast classification's minute. */
-#define LASER_READ_MAX_MEDIUM_ERRORS 2
-
 /* For a read - READ(10), READ CD - its first block and block count:
  * for the log, since which sectors failed tells which file, and so which
  * consumer, was reading; and for the throughput sample, which counts only
@@ -302,6 +295,22 @@ laser_status_t laser_scsi_cdb(int token,
                               uint8_t *data, int data_len,
                               int data_in, int *actual_len)
 {
+    return laser_scsi_cdb_read(token, cdb, cdb_len, data, data_len, data_in,
+                               actual_len, LASER_READ_MAX_MEDIUM_ERRORS,
+                               NULL);
+}
+
+/* See scsi_internal.h. */
+laser_status_t laser_scsi_cdb_read(int token,
+                                   const uint8_t *cdb, int cdb_len,
+                                   uint8_t *data, int data_len,
+                                   int data_in, int *actual_len,
+                                   int max_medium_errors, int *medium_error)
+{
+    if (medium_error != NULL) {
+        *medium_error = 0;
+    }
+
     /* Caller bugs, caught here because their symptoms appear far from the
      * cause: an oversized cdb_len overflows the CBW's 16-byte field, and a
      * NULL buffer with a data length announces a data phase that never
@@ -576,12 +585,15 @@ laser_status_t laser_scsi_cdb(int token,
 
         /* An unreadable sector: see LASER_READ_MAX_MEDIUM_ERRORS. */
         if (is_read && sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR &&
-            ++medium_errors >= LASER_READ_MAX_MEDIUM_ERRORS) {
+            ++medium_errors >= max_medium_errors) {
             LOGW("token=%d: cdb 0x%02x%s unreadable %d times "
                  "(sense %02x/%02x/%02x), giving up on this read",
                  token, cdb[0], where, medium_errors, sense_key, asc, ascq);
             reason_logged = 1;
             result = LASER_ERR_IO;
+            if (medium_error != NULL) {
+                *medium_error = 1;
+            }
             break;
         }
 

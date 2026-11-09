@@ -53,6 +53,15 @@
  * spent: see LASER_READ_MAX_MEDIUM_ERRORS. */
 #define SCSI_SENSE_KEY_MEDIUM_ERROR     0x03
 
+/* A read the drive answered with a medium error is tried twice, not
+ * LASER_MAX_RETRIES times: the drive has already retried the sector itself,
+ * and a disc it reads poorly - read fine by another drive - fails one
+ * attempt in several. A JMicron bridge stalls three seconds on each, and
+ * the full budget made a few such sectors outlast classification's minute.
+ * read_chunked() tries the smaller reads it narrows such a failure down
+ * with once each. */
+#define LASER_READ_MAX_MEDIUM_ERRORS 2
+
 /* Under ILLEGAL REQUEST, read after a refused START STOP UNIT: "no such
  * opcode" and "not in this shape" call for opposite next steps. */
 #define SCSI_ASC_INVALID_OPCODE         0x20
@@ -148,6 +157,18 @@ typedef struct {
 } gesn_media_t;
 
 /* scsi.c */
+
+/* laser_scsi_cdb(), giving up on a read after @p max_medium_errors attempts
+ * the drive answered with a medium error rather than
+ * LASER_READ_MAX_MEDIUM_ERRORS - 1 for once - and saying, through
+ * @p medium_error if not NULL, whether the LASER_ERR_IO it returns is such
+ * an answer: the drive reached the sector and could not read it, as opposed
+ * to a drive that did not answer, or a transport failure. */
+laser_status_t laser_scsi_cdb_read(int token,
+                                   const uint8_t *cdb, int cdb_len,
+                                   uint8_t *data, int data_len,
+                                   int data_in, int *actual_len,
+                                   int max_medium_errors, int *medium_error);
 
 /* One command, without the retries of laser_scsi_cdb(), and why it failed:
  * when its CSW says FAIL, the sense REQUEST SENSE reads, into @p sense_key,
