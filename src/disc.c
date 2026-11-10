@@ -30,6 +30,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "laser.h"
 #include "laser_disc.h"
@@ -45,6 +46,14 @@
  * DVD and BD-Video detection, via libudfread
  * ============================================================================ */
 
+/* Blocks read at once for a smaller request of the UDF walk, and kept for
+ * the next ones: one command. libudfread reads the filesystem's structures
+ * a block at a time - the anchor, the volume descriptors, each directory and
+ * each file entry - and they sit together at the start of the volume, or in
+ * a Blu-ray's metadata partition. */
+#define UDF_WINDOW_BLOCKS 32
+#define UDF_BLOCK_BYTES   2048
+
 struct scsi_block_input
 {
     struct udfread_block_input base; /* must be first member */
@@ -55,7 +64,70 @@ struct scsi_block_input
      * the bus fails every command instantly, so without this the walk would
      * fire a burst of dead commands. */
     bool gone;
+
+    /* The window: UDF_WINDOW_BLOCKS blocks, NULL if there is none; where it
+     * starts and how many blocks of it are valid, 0 when empty. */
+    uint8_t *window;
+    uint32_t window_lba;
+    int window_blocks;
+
+    /* Set while a file's own data is read rather than the filesystem's
+     * structures: no window then. What follows a DVD's IFO is its VOB, whose
+     * sectors a drive refuses until authenticated, and a window reaching
+     * them is a command spent on a refusal. */
+    bool file_data;
+
+    /* For the log: the reads libudfread asked for, those sent to the drive,
+     * and the time spent in them, in milliseconds. */
+    unsigned requests;
+    unsigned commands;
+    int64_t ms;
 };
+
+static int64_t udf_now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* The read itself, through the window when it applies. */
+static int udf_read_blocks(struct scsi_block_input *sbi, uint32_t lba,
+                           void *buf, uint32_t nblocks)
+{
+    if (sbi->window != NULL && !sbi->file_data &&
+        nblocks < UDF_WINDOW_BLOCKS) {
+        bool cached = sbi->window_blocks > 0 && lba >= sbi->window_lba &&
+            (uint64_t)lba + nblocks <=
+                (uint64_t)sbi->window_lba + (uint32_t)sbi->window_blocks;
+
+        if (!cached) {
+            /* Read as a read-ahead is: the blocks past the request are
+             * nobody's yet. One attempt, nothing held against them, and a
+             * window that fails or comes back short takes nothing from the
+             * request, read below as it always was. */
+            sbi->commands++;
+            int got = laser_read_blocks_ahead(sbi->token, lba,
+                                              UDF_WINDOW_BLOCKS, sbi->window);
+            if (got == LASER_ERR_MEDIA_GONE || got == LASER_ERR_NO_DEVICE ||
+                got == LASER_ERR_CANCELLED)
+                return got;
+            sbi->window_lba = lba;
+            sbi->window_blocks = got > 0 ? got : 0;
+            cached = (uint32_t)sbi->window_blocks >= nblocks;
+        }
+
+        if (cached) {
+            memcpy(buf, sbi->window +
+                        (size_t)(lba - sbi->window_lba) * UDF_BLOCK_BYTES,
+                   (size_t)nblocks * UDF_BLOCK_BYTES);
+            return (int)nblocks;
+        }
+    }
+
+    sbi->commands++;
+    return laser_read_blocks(sbi->token, lba, (int)nblocks, buf);
+}
 
 static int udf_read_cb(struct udfread_block_input *bi, uint32_t lba,
                        void *buf, uint32_t nblocks, int flags)
@@ -66,7 +138,10 @@ static int udf_read_cb(struct udfread_block_input *bi, uint32_t lba,
     if (sbi->gone)
         return -1;
 
-    int ret = laser_read_blocks(sbi->token, lba, (int)nblocks, buf);
+    sbi->requests++;
+    const int64_t started = udf_now_ms();
+    int ret = udf_read_blocks(sbi, lba, buf, nblocks);
+    sbi->ms += udf_now_ms() - started;
 
     /* The callback has room for two outcomes only. The terminal statuses are
      * acted on here; a short read is a failure, since half a metadata
@@ -113,16 +188,20 @@ static uint32_t udf_size_cb(struct udfread_block_input *bi)
  * DVD-Videos carry an empty /AUDIO_TS. The zone's manager file must open
  * with its identifier, which is what libdvdread checks at open time.
  *
+ * @param sbi   the volume's input, told that the read is of a file's data
  * @param path  the zone's manager file, absolute on the UDF volume
  * @param magic its identifier, exactly UDF_ZONE_MAGIC_LEN bytes */
-static bool udf_zone_present(udfread *udf, const char *path, const char *magic)
+static bool udf_zone_present(udfread *udf, struct scsi_block_input *sbi,
+                             const char *path, const char *magic)
 {
     UDFFILE *f = udfread_file_open(udf, path);
     if (f == NULL)
         return false;
 
     char buf[UDF_ZONE_MAGIC_LEN];
+    sbi->file_data = true;
     ssize_t got = udfread_file_read(f, buf, sizeof(buf));
+    sbi->file_data = false;
     udfread_file_close(f);
 
     return got == (ssize_t)sizeof(buf)
@@ -532,6 +611,9 @@ static laser_disc_kind_t detect_udf_disc(int token, const char *const *langs,
         return LASER_DISC_UNKNOWN;
     }
 
+    /* Without it, every read goes to the drive as asked. */
+    sbi.window = malloc((size_t)UDF_WINDOW_BLOCKS * UDF_BLOCK_BYTES);
+
     int udf_ret = udfread_open_input(udf, &sbi.base);
     if (udf_ret != 0)
     {
@@ -540,14 +622,14 @@ static laser_disc_kind_t detect_udf_disc(int token, const char *const *langs,
     }
     else
     {
-        bool has_video = udf_zone_present(udf, UDF_VIDEO_ZONE_IFO,
+        bool has_video = udf_zone_present(udf, &sbi, UDF_VIDEO_ZONE_IFO,
                                           UDF_VIDEO_ZONE_MAGIC);
         LOGI("token=%d: UDF volume opened, %s: %s", token,
              UDF_VIDEO_ZONE_IFO, has_video ? "present" : "absent");
 
         if (has_video)
         {
-            bool has_audio = udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
+            bool has_audio = udf_zone_present(udf, &sbi, UDF_AUDIO_ZONE_IFO,
                                               UDF_AUDIO_ZONE_MAGIC);
             LOGI("token=%d: %s: %s", token, UDF_AUDIO_ZONE_IFO,
                  has_audio ? "present" : "absent");
@@ -566,7 +648,7 @@ static laser_disc_kind_t detect_udf_disc(int token, const char *const *langs,
             }
             else
             {
-                bool has_audio = udf_zone_present(udf, UDF_AUDIO_ZONE_IFO,
+                bool has_audio = udf_zone_present(udf, &sbi, UDF_AUDIO_ZONE_IFO,
                                                   UDF_AUDIO_ZONE_MAGIC);
                 LOGI("token=%d: %s: %s", token, UDF_AUDIO_ZONE_IFO,
                      has_audio ? "present" : "absent");
@@ -586,6 +668,11 @@ static laser_disc_kind_t detect_udf_disc(int token, const char *const *langs,
     }
 
     udfread_close(udf);
+    free(sbi.window);
+
+    /* What the window is worth, on this disc and this drive. */
+    LOGI("token=%d: UDF walk: %u reads asked, %u sent to the drive, %lld ms",
+         token, sbi.requests, sbi.commands, (long long)sbi.ms);
     return kind;
 }
 

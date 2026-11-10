@@ -18,6 +18,7 @@ XXXX-XX-XX: version 0.3.2
     - Simplifications
     - Answer what is known of a block without waiting for the drive
     - Lower the transfer size of a device only once a failure has repeated
+    - Read the UDF structures a window at a time when identifying a disc
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/
