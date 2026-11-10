@@ -559,6 +559,9 @@ static laser_entry_t *laser_register(int fd, laser_status_t *why)
         goto err_iface;
     }
 
+    /* The disc found is not news to the first media poll. */
+    laser_drop_media_events(entry);
+
     /* Publish, last and under the table lock, so that whoever sees
      * in_use == 1 also sees every field written above. */
     pthread_mutex_lock(&g_table_lock);

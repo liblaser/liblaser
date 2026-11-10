@@ -19,6 +19,7 @@ XXXX-XX-XX: version 0.3.2
     - Answer what is known of a block without waiting for the drive
     - Lower the transfer size of a device only once a failure has repeated
     - Read the UDF structures a window at a time when identifying a disc
+    - Do not take the media event of a drive's power-up for a change of disc
     - Add laser_set_speed(), to ask a drive to spin a disc slower
 
 2026-11-05: version 0.3.1

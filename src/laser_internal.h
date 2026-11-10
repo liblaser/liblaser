@@ -480,6 +480,18 @@ void laser_allow_medium_removal(laser_entry_t *entry);
  */
 int laser_wait_until_ready(laser_entry_t *entry);
 
+/* Reads and drops the media events the drive holds, if its disc is ready.
+ *
+ * For the end of a registration. A drive connected with a disc inside holds
+ * the "new media" of its own power-up, and gives it to the first
+ * laser_media_poll(), seconds later: the event of a disc already found and
+ * being read, taken there for another disc - its consumers told that it
+ * changed, and a stream on it stopped.
+ *
+ * Not for a drive whose disc is not ready: the event to come is then the
+ * news that it is. */
+void laser_drop_media_events(laser_entry_t *entry);
+
 /**
  * On a token already registered, one TEST UNIT READY, then
  * laser_wait_until_ready() if the unit is not ready.

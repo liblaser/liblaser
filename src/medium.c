@@ -69,6 +69,26 @@ int laser_gesn_media_locked(laser_entry_t *entry, gesn_media_t *out,
     return 0;
 }
 
+/* See laser_internal.h. */
+void laser_drop_media_events(laser_entry_t *entry)
+{
+    pthread_mutex_lock(&entry->io_lock);
+
+    /* A drive holds few events, and a firmware that never answers "no
+     * change" is not asked for ever. */
+    for (int i = 0; i < 4 && entry->wait_state == LASER_WAIT_READY; i++) {
+        gesn_media_t g;
+        if (laser_gesn_media_locked(entry, &g, NULL, NULL, NULL) != 0 ||
+            g.nea || g.cls != GESN_CLASS_MEDIA || g.event == 0)
+            break;
+        LOGI("token=%d: media event %d (raw %02x %02x) from before the "
+             "registration, dropped", entry->token, g.event, g.raw[2],
+             g.raw[3]);
+    }
+
+    pthread_mutex_unlock(&entry->io_lock);
+}
+
 /* ============================================================================
  * What the medium is, and how fast it is read
  * ========================================================================= */
