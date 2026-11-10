@@ -510,6 +510,7 @@ laser_status_t laser_scsi_cdb_read(int token,
         if (medium == MEDIUM_SENSE_ABSENT || medium == MEDIUM_SENSE_TRAY_OPEN) {
             LOGW("token=%d: no disc present (%02x/%02x/%02x), not retrying",
                  token, sense_key, asc, ascq);
+            laser_disc_changed_locked(entry);
             result = LASER_ERR_MEDIA_GONE;
             break;
         }
@@ -529,6 +530,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                 continue;
             }
             LOGW("token=%d: medium may have changed, not retrying", token);
+            laser_disc_changed_locked(entry);
             result = LASER_ERR_MEDIA_GONE;
             break;
         }

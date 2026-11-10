@@ -682,7 +682,8 @@ typedef struct {
  * whoever polls is then the one told of a swap.
  *
  * Events are consumed too: several consumers polling one token share them,
- * each seeing only the ones the others have not read.
+ * each seeing only the ones the others have not read. What none of them can
+ * miss is laser_media_generation().
  *
  * @param token the registry token; a claim must be held. A poller keeps one
  *              between calls, or each call would register the device anew.
@@ -692,6 +693,30 @@ typedef struct {
  *         LASER_ERR_IO when the drive answered neither command.
  */
 laser_status_t laser_media_poll(int token, laser_media_status_t *out);
+
+/**
+ * A count that changes whenever the drive is seen without the medium it had,
+ * or with another.
+ *
+ * A change of medium is reported by the drive ONCE, to whichever command
+ * meets it: a read answered LASER_ERR_MEDIA_GONE, a media poll, the readiness
+ * wait of laser_disc_identify(). The other consumers of the token see
+ * nothing: their next read succeeds, on another disc. This count is how they
+ * learn it - take it once the medium is known, when a stream is opened, and
+ * compare it before trusting what was learnt of that medium: its size, its
+ * blocks, a position in it.
+ *
+ * Only a change means something, not the value: one swap may raise it more
+ * than once, and it starts anywhere. A lookup, no command.
+ *
+ * NOT RAISED when the drive, becoming ready again after a standby, answers
+ * MEDIUM MAY HAVE CHANGED to the very command that woke it: that command is
+ * retried, as before.
+ *
+ * @param token the registry token; a claim must be held.
+ * @return the count; 0 for a token that is not registered.
+ */
+unsigned laser_media_generation(int token);
 
 /**
  * Lock the tray, or unlock it: PREVENT ALLOW MEDIUM REMOVAL. Locked, the

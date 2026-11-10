@@ -240,6 +240,11 @@ static laser_status_t media_events(laser_entry_t *entry,
         if (rc == 0 || rc == BOT_FAIL_NO_DEVICE ||
             sense_key != SCSI_SENSE_KEY_UNIT_ATTENTION)
             break;
+        /* The UNIT ATTENTION of a changed medium, consumed here: said to
+         * the other consumers, whatever event follows. */
+        if (asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+            ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED)
+            laser_disc_changed_locked(entry);
     }
     pthread_mutex_unlock(&entry->io_lock);
 
@@ -358,8 +363,10 @@ laser_status_t laser_media_poll(int token, laser_media_status_t *out)
     if (st == LASER_ERR_REFUSED)
         st = media_from_unit_ready(entry, out);
 
-    /* Another disc: the blocks known not to read were the last one's. */
-    if (st == LASER_OK && out->event == LASER_MEDIA_NEW)
+    /* Another disc, or none: the blocks known not to read were the last
+     * one's, and its consumers are told (laser_media_generation()). */
+    if (st == LASER_OK && (out->event == LASER_MEDIA_NEW ||
+                           out->event == LASER_MEDIA_REMOVED))
         laser_forget_disc(entry, token);
 
     /* A new medium: the registration's wait answered for the one before, or

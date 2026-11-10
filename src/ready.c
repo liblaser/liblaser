@@ -316,6 +316,10 @@ void laser_wait_until_ready(laser_entry_t *entry)
     int64_t becoming_ready_last = started;
     int unit_attentions = 0;
 
+    /* Whether this wait has already said the medium left: once is enough
+     * for laser_entry_t::media_generation, however many polls say it. */
+    int medium_left = 0;
+
     /* Bounded by the ceilings alone: every path below either returns, sleeps
      * and meets a ceiling check, or is a UNIT ATTENTION retry, itself
      * bounded. */
@@ -360,6 +364,21 @@ void laser_wait_until_ready(laser_entry_t *entry)
         if (medium == MEDIUM_SENSE_LOADING) {
             becoming_ready = 1;
             becoming_ready_last = now;
+        }
+
+        /* The medium left, or another came: reported here to this wait and
+         * to nobody else, so said here to every consumer of the token. At
+         * registration there is none yet, and nothing to forget. */
+        if ((medium == MEDIUM_SENSE_ABSENT ||
+             medium == MEDIUM_SENSE_TRAY_OPEN) && !medium_left) {
+            medium_left = 1;
+            laser_disc_changed_locked(entry);
+        }
+        if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
+            asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+            ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) {
+            medium_left = 0;
+            laser_disc_changed_locked(entry);
         }
 
         if (medium == MEDIUM_SENSE_TRAY_OPEN) {
@@ -441,9 +460,10 @@ void laser_wait_until_ready(laser_entry_t *entry)
     pthread_mutex_unlock(&entry->io_lock);
 }
 
-/* See laser_internal.h. The sense of a failed TEST UNIT READY is left for
- * the wait, whose first command replaces it: what matters is that the drive
- * is not ready, not why.
+/* See laser_internal.h. The sense of a failed TEST UNIT READY is read: a
+ * medium gone or changed is reported once, here if this is the command that
+ * meets it, and the other consumers of the token learn it from
+ * laser_entry_t::media_generation alone.
  *
  * A drive whose wait already ran out ("never became ready") is checked once
  * more but not waited for again: ready now, its state is ready; still not
@@ -457,10 +477,19 @@ void laser_token_settle(int token)
     pthread_mutex_lock(&entry->io_lock);
     const int was_not_ready = entry->wait_state != LASER_WAIT_READY;
     uint8_t sense_key = 0xff, asc = 0, ascq = 0;
-    int rc = laser_test_unit_ready_locked(entry,
-                                          was_not_ready ? &sense_key : NULL,
-                                          &asc, &ascq);
+    int rc = laser_test_unit_ready_locked(entry, &sense_key, &asc, &ascq);
     int loading = 0;
+
+    if (rc != 0 && rc != BOT_FAIL_NO_DEVICE) {
+        const medium_sense_t medium = laser_medium_sense(sense_key, asc, ascq);
+        if (medium == MEDIUM_SENSE_ABSENT ||
+            medium == MEDIUM_SENSE_TRAY_OPEN ||
+            (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
+             asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+             ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED))
+            laser_disc_changed_locked(entry);
+    }
+
     if (rc == 0) {
         entry->wait_state = LASER_WAIT_READY;
     } else if (rc != BOT_FAIL_NO_DEVICE && was_not_ready) {

@@ -219,14 +219,36 @@ static void forget_refusals(laser_entry_t *entry, int token, const char *why)
 }
 
 /* See scsi_internal.h. */
-void laser_forget_disc(laser_entry_t *entry, int token)
+void laser_disc_changed_locked(laser_entry_t *entry)
 {
-    pthread_mutex_lock(&entry->io_lock);
+    int count = 0;
+
+    for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS; i++) {
+        count += entry->unreadable[i].count > 0;
+    }
+    for (unsigned i = 0; i < LASER_REFUSAL_SLOTS; i++) {
+        count += entry->refused[i].hits > 0;
+    }
+
     memset(entry->unreadable, 0, sizeof(entry->unreadable));
     entry->unreadable_next = 0;
-    pthread_mutex_unlock(&entry->io_lock);
+    memset(entry->refused, 0, sizeof(entry->refused));
+    entry->media_generation++;
 
-    forget_refusals(entry, token, "the disc changed");
+    if (count > 0) {
+        LOGI("token=%d: the disc changed or left - forgetting %d unreadable "
+             "or refused range(s)", entry->token, count);
+    }
+}
+
+/* See scsi_internal.h. */
+void laser_forget_disc(laser_entry_t *entry, int token)
+{
+    (void) token;
+
+    pthread_mutex_lock(&entry->io_lock);
+    laser_disc_changed_locked(entry);
+    pthread_mutex_unlock(&entry->io_lock);
 }
 
 int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks)
@@ -315,7 +337,9 @@ int laser_refused_for_good(int token, uint32_t lba)
  * that block is recorded (laser_entry_t::refused); a read reaching it stops
  * short of it, and after LASER_REFUSAL_MAX_HITS refusals one starting on it
  * gets the status without the drive. Both are forgotten when the disc
- * changes, the refusals also when the drive reports no CSS session.
+ * changes - whichever command or poll learns it, see
+ * laser_disc_changed_locked() - the refusals also when the drive reports no
+ * CSS session.
  *
  * A MEDIUM ERROR IS NARROWED DOWN. A chunk the drive answered with a medium
  * error - it reached the sector and could not read it - is read again at
@@ -430,11 +454,10 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
                 *invalid_field = 1;
             }
 
+            /* On LASER_ERR_MEDIA_GONE, the command layer has already
+             * forgotten what was known of the disc's blocks. */
             if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
                 st == LASER_ERR_CANCELLED) {
-                if (st == LASER_ERR_MEDIA_GONE && entry != NULL) {
-                    laser_forget_disc(entry, token);
-                }
                 return (int)st;
             }
 

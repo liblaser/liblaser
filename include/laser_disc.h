@@ -167,7 +167,8 @@ typedef struct {
  * command is serialized like any other, but the sequence is not atomic: a
  * disc swapped mid-identification most likely yields LASER_DISC_UNKNOWN.
  * The wait above also consumes the UNIT ATTENTION of a swap, which another
- * consumer of the token then never sees.
+ * consumer of the token then never sees: laser_media_generation() is how it
+ * learns of it.
  *
  * A Blu-ray's title comes in English when the disc has it, otherwise in the
  * first language listed: laser_disc_identify_lang() with no preference.

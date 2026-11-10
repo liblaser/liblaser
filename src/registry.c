@@ -171,6 +171,12 @@ int laser_token_not_ready(int token)
     return entry != NULL && entry->wait_state != LASER_WAIT_READY;
 }
 
+unsigned laser_media_generation(int token)
+{
+    laser_entry_t *entry = laser_lookup(token);
+    return entry != NULL ? entry->media_generation : 0;
+}
+
 /** Accessors of laser_entry_t::cancelled. The write takes the table lock so
  * that it cannot race with release_slot()'s memset. The read takes none: it
  * is on the transaction path, and the flag only ever goes from 0 to 1. */

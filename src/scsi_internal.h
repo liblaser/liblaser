@@ -241,8 +241,17 @@ int laser_gesn_media_locked(laser_entry_t *entry, gesn_media_t *out,
 
 /* read.c */
 
-/* The disc changed, or left: what was known of its blocks goes with it.
- * Takes entry->io_lock: the caller MUST NOT hold it. */
+/* The disc changed, or left: what was known of its blocks goes with it, and
+ * laser_entry_t::media_generation says so to every consumer.
+ *
+ * Called wherever the drive says so, by whichever command it says it to: a
+ * UNIT ATTENTION is reported once, to one consumer, and the others would
+ * otherwise go on with the blocks and the size of the disc before.
+ *
+ * Caller MUST already hold entry->io_lock. */
+void laser_disc_changed_locked(laser_entry_t *entry);
+
+/* The same, taking entry->io_lock: the caller MUST NOT hold it. */
 void laser_forget_disc(laser_entry_t *entry, int token);
 
 #endif /* LASER_SCSI_INTERNAL_H */

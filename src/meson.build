@@ -27,6 +27,7 @@ laser_public_symbols = [
     'laser_media_poll',
     'laser_media_lock',
     'laser_media_eject',
+    'laser_media_generation',
 ]
 
 # Our own code, with warnings - the vendored targets are not ours to keep

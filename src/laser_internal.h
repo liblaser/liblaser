@@ -166,6 +166,16 @@ typedef struct {
         unsigned hits;
     } refused[LASER_REFUSAL_SLOTS];
 
+    /* Counts the times the drive was seen without the medium it had, or with
+     * another: see laser_media_generation() in laser.h. Whoever sees it - a
+     * command answered MEDIUM NOT PRESENT or MEDIUM MAY HAVE CHANGED, a
+     * readiness wait, a media poll - raises it and empties the two tables
+     * above, in laser_disc_changed_locked().
+     *
+     * Written under io_lock, read without it: a reader that misses a change
+     * sees it at its next look. */
+    unsigned media_generation;
+
     /* Raised by the laser_release() that drops the last claim, just before
      * teardown, and never cleared; the slot is memset afterwards. An
      * operation still running on another thread sees it between retry
