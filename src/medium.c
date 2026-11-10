@@ -322,6 +322,8 @@ static laser_status_t media_from_unit_ready(laser_entry_t *entry,
     case MEDIUM_SENSE_LOADING:
         out->medium = LASER_MEDIUM_PRESENT;
         return LASER_OK;
+    case MEDIUM_SENSE_START_NEEDED:
+    case MEDIUM_SENSE_INTERVENTION:
     case MEDIUM_SENSE_OTHER:
         break;
     }

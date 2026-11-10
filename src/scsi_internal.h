@@ -53,6 +53,16 @@
  * spent: see LASER_READ_MAX_MEDIUM_ERRORS. */
 #define SCSI_SENSE_KEY_MEDIUM_ERROR     0x03
 
+/* The drive itself failing - a servo that cannot follow the track, a laser
+ * that cannot focus. On a read it gets the short budget of a medium error:
+ * the drive has tried. But it is said of scratched sectors and by an
+ * underpowered drive alike, so nothing is held against the blocks. */
+#define SCSI_SENSE_KEY_HARDWARE_ERROR   0x04
+
+/* Nothing is recorded there: the area of a recordable disc past what was
+ * written. As final as a refusal, and reported as one. */
+#define SCSI_SENSE_KEY_BLANK_CHECK      0x08
+
 /* A read the drive answered with a medium error is tried twice, not
  * LASER_MAX_RETRIES times: the drive has already retried the sector itself,
  * and a disc it reads poorly - read fine by another drive - fails one
@@ -103,8 +113,20 @@
 /* 04h: not ready, 04h/01h being "becoming ready". In the spin-up wait it
  * raises the ceiling and is recorded: a drive that leaves the bus right after
  * saying it was drawing spindle current. In laser_scsi_cdb() it is waited
- * out rather than retried. */
+ * out rather than retried.
+ *
+ * Two qualifiers under it are not a drive working on it, and no wait brings
+ * them to ready:
+ *
+ *   04h/02h INITIALIZING COMMAND REQUIRED  the unit is stopped, and stays so
+ *                                          until told to start
+ *   04h/03h MANUAL INTERVENTION REQUIRED   somebody has to go to the drive
+ *
+ * The others - cause not reportable, an operation in progress - are waited
+ * for like 04h/01h. */
 #define SCSI_ASC_BECOMING_READY         0x04
+#define SCSI_ASCQ_NR_START_NEEDED       0x02
+#define SCSI_ASCQ_NR_INTERVENTION       0x03
 
 #define SCSI_ASC_MEDIUM_NOT_PRESENT     0x3a
 /* The qualifiers under 3Ah, which the spin-up wait tells apart. 3Ah/02h, tray
@@ -140,6 +162,10 @@ typedef enum {
     MEDIUM_SENSE_TRAY_OPEN,
     /** 02h/04h, becoming ready: the drive is loading or spinning up. */
     MEDIUM_SENSE_LOADING,
+    /** 02h/04h/02h: stopped, until a START STOP UNIT starts it. */
+    MEDIUM_SENSE_START_NEEDED,
+    /** 02h/04h/03h: not ready until somebody goes to the drive. */
+    MEDIUM_SENSE_INTERVENTION,
 } medium_sense_t;
 
 medium_sense_t laser_medium_sense(uint8_t sense_key, uint8_t asc,

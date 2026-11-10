@@ -406,6 +406,15 @@ int laser_wait_until_ready(laser_entry_t *entry)
             laser_disc_changed_locked(entry);
         }
 
+        /* Nothing this wait can do, nor wait for. */
+        if (medium == MEDIUM_SENSE_INTERVENTION) {
+            LOGW("token=%d: the drive asks for manual intervention (attempt "
+                 "%d), giving up wait", entry->token, attempt);
+            entry->wait_state = LASER_WAIT_NOT_READY;
+            pthread_mutex_unlock(&entry->io_lock);
+            return 0;
+        }
+
         if (medium == MEDIUM_SENSE_TRAY_OPEN) {
             LOGW("token=%d: tray open (attempt %d), giving up wait",
                  entry->token, attempt);
@@ -530,6 +539,8 @@ static void settle_entry(laser_entry_t *entry, int token)
         case MEDIUM_SENSE_LOADING:
             loading = 1;
             break;
+        case MEDIUM_SENSE_START_NEEDED:
+        case MEDIUM_SENSE_INTERVENTION:
         case MEDIUM_SENSE_OTHER:
             break;
         }

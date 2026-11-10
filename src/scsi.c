@@ -95,14 +95,46 @@ static int request_sense_locked(laser_entry_t *entry,
                                 1, &actual_len, NULL) < 0) {
         return -1;
     }
-    if (actual_len < 14) {
+    /* The response code says where the three values are, and whose they
+     * are (SPC):
+     *
+     *   70h  fixed format, of the command that just failed
+     *   72h  descriptor format, likewise: key, ASC and ASCQ lead it
+     *   71h, 73h  DEFERRED: of a command that had already answered - a
+     *        cached write, most often. It says nothing of the one that just
+     *        failed, and read as its sense it would send the retry policy
+     *        after the wrong cause.
+     *
+     * Any other code is read as fixed format, as every code was before:
+     * a bridge that answers the right bytes under a wrong code keeps its
+     * sense. On -1 the caller's values are left as they were, "no sense". */
+    switch (actual_len >= 1 ? buffer[0] & 0x7f : 0x70) {
+    default:
+    case 0x70:
+        if (actual_len < 14) {
+            return -1;
+        }
+        *sense_key = buffer[2] & 0x0f;
+        *asc = buffer[12];
+        *ascq = buffer[13];
+        return 0;
+    case 0x72:
+        if (actual_len < 4) {
+            return -1;
+        }
+        *sense_key = buffer[1] & 0x0f;
+        *asc = buffer[2];
+        *ascq = buffer[3];
+        return 0;
+    case 0x71:
+    case 0x73:
+        LOGW("token=%d: deferred sense %02x/%02x/%02x, of an earlier "
+             "command: not read as this one's", entry->token,
+             (buffer[0] & 0x7f) == 0x71 ? buffer[2] & 0x0f : buffer[1] & 0x0f,
+             (buffer[0] & 0x7f) == 0x71 ? buffer[12] : buffer[2],
+             (buffer[0] & 0x7f) == 0x71 ? buffer[13] : buffer[3]);
         return -1;
     }
-
-    *sense_key = buffer[2] & 0x0f;
-    *asc = buffer[12];
-    *ascq = buffer[13];
-    return 0;
 }
 
 /* Whether this command does its work before its status, with no data phase
@@ -155,8 +187,13 @@ medium_sense_t laser_medium_sense(uint8_t sense_key, uint8_t asc,
     if (asc == SCSI_ASC_MEDIUM_NOT_PRESENT)
         return ascq == SCSI_ASCQ_TRAY_OPEN ? MEDIUM_SENSE_TRAY_OPEN
                                            : MEDIUM_SENSE_ABSENT;
-    if (asc == SCSI_ASC_BECOMING_READY)
+    if (asc == SCSI_ASC_BECOMING_READY) {
+        if (ascq == SCSI_ASCQ_NR_START_NEEDED)
+            return MEDIUM_SENSE_START_NEEDED;
+        if (ascq == SCSI_ASCQ_NR_INTERVENTION)
+            return MEDIUM_SENSE_INTERVENTION;
         return MEDIUM_SENSE_LOADING;
+    }
     return MEDIUM_SENSE_OTHER;
 }
 
@@ -461,6 +498,9 @@ laser_status_t laser_scsi_cdb_read(int token,
     int resets_in_a_row = 0;
     int medium_errors = 0;
 
+    /* Whether the drive, stopped, has been told to start: once a command. */
+    int start_sent = 0;
+
     for (int attempt = 1; attempt <= LASER_MAX_RETRIES; attempt++) {
         attempts_made = attempt;
 
@@ -680,9 +720,12 @@ laser_status_t laser_scsi_cdb_read(int token,
 
         /* Permanently refused: the drive will answer the same way every
          * time, and six delayed retries per read would turn a clean error
-         * into what a user experiences as a hang. */
+         * into what a user experiences as a hang. BLANK CHECK with them:
+         * nothing is recorded where the command reads, the area of a
+         * recordable disc past what was written, and nothing will be. */
         if (sense_key == SCSI_SENSE_KEY_ILLEGAL_REQUEST ||
-            sense_key == SCSI_SENSE_KEY_DATA_PROTECT) {
+            sense_key == SCSI_SENSE_KEY_DATA_PROTECT ||
+            sense_key == SCSI_SENSE_KEY_BLANK_CHECK) {
             LOGW("token=%d: cdb 0x%02x%s permanently refused "
                  "(sense %02x/%02x/%02x), not retrying",
                  token, cdb[0], where, sense_key, asc, ascq);
@@ -691,15 +734,19 @@ laser_status_t laser_scsi_cdb_read(int token,
             break;
         }
 
-        /* An unreadable sector: see LASER_READ_MAX_MEDIUM_ERRORS. */
-        if (is_read && sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR &&
+        /* An unreadable sector: see LASER_READ_MAX_MEDIUM_ERRORS. The same
+         * budget for a HARDWARE ERROR, which the drive answers after trying
+         * as hard - but only a medium error is the disc's, for the caller
+         * to hold against the blocks. */
+        if (is_read && (sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR ||
+                        sense_key == SCSI_SENSE_KEY_HARDWARE_ERROR) &&
             ++medium_errors >= max_medium_errors) {
             LOGW("token=%d: cdb 0x%02x%s unreadable %d times "
                  "(sense %02x/%02x/%02x), giving up on this read",
                  token, cdb[0], where, medium_errors, sense_key, asc, ascq);
             reason_logged = 1;
             result = LASER_ERR_IO;
-            if (why != NULL) {
+            if (why != NULL && sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR) {
                 why->medium_error = 1;
             }
             break;
@@ -717,6 +764,36 @@ laser_status_t laser_scsi_cdb_read(int token,
             reason_logged = 1;
             result = LASER_ERR_IO;
             break;
+        }
+
+        /* Not ready until somebody goes to the drive: waiting thirty
+         * seconds, as for one becoming ready, brings nothing. */
+        if (medium == MEDIUM_SENSE_INTERVENTION) {
+            LOGW("token=%d: cdb 0x%02x%s - the drive asks for manual "
+                 "intervention (sense %02x/%02x/%02x), not retrying",
+                 token, cdb[0], where, sense_key, asc, ascq);
+            reason_logged = 1;
+            result = LASER_ERR_IO;
+            break;
+        }
+
+        /* Stopped, and saying it will stay so until told to start: told,
+         * once, without waiting for the spin-up - the wait below does, the
+         * drive answering "becoming ready" from then on. Without spending
+         * an attempt. A second such answer gets the ordinary delayed
+         * retry. */
+        if (medium == MEDIUM_SENSE_START_NEEDED && !start_sent) {
+            static const uint8_t start_unit[6] = {
+                0x1b, 0x01 /* IMMED */, 0x00, 0x00, 0x01 /* START */, 0x00,
+            };
+            LOGI("token=%d: cdb 0x%02x: drive stopped (sense %02x/%02x/%02x),"
+                 " starting it", token, cdb[0], sense_key, asc, ascq);
+            start_sent = 1;
+            laser_command_locked(entry, start_unit, sizeof(start_unit), NULL,
+                                 0, NULL, NULL, NULL, NULL, NULL);
+            attempt--;
+            laser_retry_delay(entry, idempotent);
+            continue;
         }
 
         /* A drive waking from standby answers "becoming ready" far longer

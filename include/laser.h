@@ -125,8 +125,9 @@ typedef enum {
     LASER_ERR_MEDIA_GONE = -3,
     /**
      * The drive understood the command and refuses it as issued: sense key
-     * ILLEGAL REQUEST or DATA PROTECT - a malformed CDB, an LBA past the
-     * medium, content the drive will not serve in its current state.
+     * ILLEGAL REQUEST, DATA PROTECT or BLANK CHECK - a malformed CDB, an LBA
+     * past the medium or past what was written on a recordable one, content
+     * the drive will not serve in its current state.
      *
      * Kept apart from LASER_ERR_IO because the responses are opposite: an
      * I/O error may be a scratch, and the next sector may read; a refusal
@@ -356,7 +357,10 @@ int laser_token_not_ready(int token);
  * Handled internally:
  *   - CBW/CSW framing, stall recovery and Reset Recovery;
  *   - retries of transient conditions, up to six attempts: UNIT ATTENTION at
- *     once, NOT READY and anything unexplained after a short delay;
+ *     once, NOT READY and anything unexplained after a short delay. A drive
+ *     becoming ready is waited for, up to thirty seconds; one that says it
+ *     is stopped is started first; one asking for manual intervention fails
+ *     the command at once, with LASER_ERR_IO;
  *   - no retry at all on MEDIUM NOT PRESENT and MEDIUM MAY HAVE CHANGED
  *     (LASER_ERR_MEDIA_GONE), nor on a refusal (LASER_ERR_REFUSED and the
  *     copy-protection statuses) - waiting resolves none of them;
