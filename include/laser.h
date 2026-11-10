@@ -193,6 +193,21 @@ typedef enum {
      * consumer may stop offering it as a drive until it is unplugged.
      */
     LASER_ERR_NOT_OPTICAL = -11,
+
+    /**
+     * laser_media_poll() only: the poll was not made. Another consumer's
+     * command holds the drive, or one failed moments ago and the drive is
+     * left alone to recover.
+     *
+     * Nothing was asked and nothing is known - not that nothing happened:
+     * the status is not filled, and what the last poll said still stands.
+     * Nothing is lost either, the drive keeping its events until they are
+     * read: poll again at the usual pace.
+     *
+     * Kept apart from LASER_ERR_IO, which it used to be: a poller counting
+     * the drive's failures would count a film being read as one.
+     */
+    LASER_ERR_BUSY = -12,
 } laser_status_t;
 
 /* ============================================================================
@@ -751,7 +766,8 @@ typedef struct {
  *              between calls, or each call would register the device anew.
  * @param out   filled on LASER_OK; must not be NULL.
  * @return LASER_OK, LASER_ERR_NO_DEVICE, LASER_ERR_CANCELLED,
- *         LASER_ERR_NO_SUCH_TOKEN, LASER_ERR_INVALID (NULL @p out), or
+ *         LASER_ERR_NO_SUCH_TOKEN, LASER_ERR_INVALID (NULL @p out),
+ *         LASER_ERR_BUSY when the drive was busy and the poll not made, or
  *         LASER_ERR_IO when the drive answered neither command.
  */
 laser_status_t laser_media_poll(int token, laser_media_status_t *out);

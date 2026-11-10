@@ -185,8 +185,8 @@ int laser_region_mismatch(int token, uint8_t *drive_mask, uint8_t *disc_mask)
  * The medium: events, tray lock, eject - see laser.h
  * ========================================================================= */
 
-/* Takes io_lock for a poll, or fails at once - the poll skipped - if another
- * command holds it, or if a command failed an attempt less than
+/* Takes io_lock for a poll, or fails at once - the poll skipped, and
+ * answered LASER_ERR_BUSY - if another command holds it, or if a command failed an attempt less than
  * LASER_POLL_QUIET_MS ago. A poll only matters when the drive is idle, and
  * the next one comes a second or two later. Queued behind a read the drive
  * is failing, or slipping in while that read waits between two attempts -
@@ -217,7 +217,8 @@ static int poll_lock(laser_entry_t *entry)
  * behind it. A UNIT ATTENTION alone is asked again at once: reported, it is
  * cleared, and costs nothing.
  *
- * Returns LASER_OK and fills @p out; LASER_ERR_REFUSED only when the drive
+ * Returns LASER_OK and fills @p out; LASER_ERR_BUSY for a poll skipped;
+ * LASER_ERR_REFUSED only when the drive
  * says it has no media events - the command refused as ILLEGAL REQUEST, or
  * answered with "no event class supported" - which turns them off for the
  * token; LASER_ERR_NO_DEVICE; LASER_ERR_IO for anything else, a short or
@@ -234,7 +235,7 @@ static laser_status_t media_events(laser_entry_t *entry,
     /* A drive busy with another consumer's command is not polled: see
      * poll_lock(). */
     if (!poll_lock(entry))
-        return LASER_ERR_IO;
+        return LASER_ERR_BUSY;
     for (int attempt = 1; attempt <= 2; attempt++) {
         rc = laser_gesn_media_locked(entry, &g, &sense_key, &asc, &ascq);
         if (rc == 0 || rc == BOT_FAIL_NO_DEVICE ||
@@ -296,7 +297,7 @@ static laser_status_t media_from_unit_ready(laser_entry_t *entry,
                                             laser_media_status_t *out)
 {
     if (!poll_lock(entry))
-        return LASER_ERR_IO;
+        return LASER_ERR_BUSY;
 
     uint8_t sense_key, asc, ascq;
     int rc = laser_test_unit_ready_locked(entry, &sense_key, &asc, &ascq);
