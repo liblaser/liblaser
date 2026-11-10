@@ -195,19 +195,27 @@ typedef struct {
 
 /* scsi.c */
 
+/* What a LASER_ERR_IO of a read is, as far as the drive said. */
+typedef enum {
+    /* The drive's or the transport's: a drive not ready within its budget,
+     * a hardware error, a bridge failing a transfer. Nothing is said of the
+     * blocks. Also the value for any status but LASER_ERR_IO. */
+    LASER_FAILURE_OTHER = 0,
+    /* The drive answered MEDIUM ERROR: it reached the sector and could not
+     * read it. */
+    LASER_FAILURE_MEDIUM,
+    /* The drive did not answer the read at all - each attempt ending in a
+     * Reset Recovery - while answering a TEST UNIT READY that it is ready,
+     * or answering nothing since: stuck on those sectors, as on the
+     * unreadable ones some protections put on purpose. With
+     * LASER_FAILURE_MEDIUM, the two failures that are the disc's. */
+    LASER_FAILURE_NO_ANSWER,
+} laser_failure_cause_t;
+
 /* Why a command failed, as far as the drive said: for a caller that reacts
  * to one answer differently from the others. */
 typedef struct {
-    /* The LASER_ERR_IO returned is the drive answering MEDIUM ERROR: it
-     * reached the sector and could not read it - not a drive that did not
-     * answer, nor a transport failure. */
-    int     medium_error;
-    /* The LASER_ERR_IO returned is the drive not answering a read at all -
-     * each attempt ending in a Reset Recovery - while answering a TEST UNIT
-     * READY that it is ready, or answering nothing since: stuck on those
-     * sectors, as on the unreadable ones some protections put on purpose.
-     * With medium_error, the two failures that are the disc's. */
-    int     no_answer;
+    laser_failure_cause_t cause;
     /* The last sense REQUEST SENSE read, 0xff/00/00 if none was. */
     uint8_t sense_key;
     uint8_t asc;

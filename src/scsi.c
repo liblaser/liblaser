@@ -383,8 +383,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                                    laser_failure_t *why)
 {
     if (why != NULL) {
-        why->medium_error = 0;
-        why->no_answer = 0;
+        why->cause = LASER_FAILURE_OTHER;
         why->sense_key = 0xff;
         why->asc = 0;
         why->ascq = 0;
@@ -608,7 +607,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                     reason_logged = 1;
                     result = LASER_ERR_IO;
                     if (why != NULL) {
-                        why->no_answer = 1;
+                        why->cause = LASER_FAILURE_NO_ANSWER;
                     }
                     break;
                 }
@@ -629,7 +628,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                     /* Stuck on the sectors if it answered nothing since;
                      * a drive saying why it is not ready is not. */
                     if (why != NULL && sense_key == 0xff) {
-                        why->no_answer = 1;
+                        why->cause = LASER_FAILURE_NO_ANSWER;
                     }
                     break;
                 }
@@ -747,7 +746,7 @@ laser_status_t laser_scsi_cdb_read(int token,
             reason_logged = 1;
             result = LASER_ERR_IO;
             if (why != NULL && sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR) {
-                why->medium_error = 1;
+                why->cause = LASER_FAILURE_MEDIUM;
             }
             break;
         }

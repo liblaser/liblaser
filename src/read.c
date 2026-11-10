@@ -365,15 +365,21 @@ int laser_refused_for_good(int token, uint32_t lba)
  * recorded unreadable for the device (laser_entry_t::unreadable): a read
  * starting in it fails at once, and one reaching it stops short of it, as a
  * short read. A LASER_ERR_IO that is the drive's or the transport's is
- * returned and nothing recorded: the next read asks the drive again. With @p refusals - READ(10)
- * - a chunk refused with a positional status is read again at half the size
- * down to the block refused, so that the blocks before it are returned, and
- * that block is recorded (laser_entry_t::refused); a read reaching it stops
- * short of it, and after LASER_REFUSAL_MAX_HITS refusals one starting on it
- * gets the status without the drive. Both are forgotten when the disc
- * changes - whichever command or poll learns it, see
- * laser_disc_changed_locked() - the refusals also when the drive reports no
- * CSS session.
+ * returned and nothing recorded: the next read asks the drive again.
+ *
+ * With @p refusals - READ(10) - a chunk refused with a positional status is
+ * read again at half the size down to the block refused, so that the blocks
+ * before it are returned, and that block is recorded
+ * (laser_entry_t::refused); a read reaching it stops short of it, and after
+ * LASER_REFUSAL_MAX_HITS refusals one starting on it gets the status without
+ * the drive. Both are forgotten when the disc changes - whichever command
+ * or poll learns it, see laser_disc_changed_locked() - the refusals also
+ * when the drive reports no CSS session.
+ *
+ * ONE WAY OF READING AGAIN. The three cases above - the bridge, a refusal,
+ * a medium error - differ in when the blocks are read again smaller and in
+ * what is recorded when they are not, and in nothing else: a failed chunk
+ * either sets the size of the next ones, lower each time, or ends the read.
  *
  * A MEDIUM ERROR IS NARROWED DOWN. A chunk the drive answered with a medium
  * error - it reached the sector and could not read it - is read again at
@@ -419,35 +425,31 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
 {
     int blocks_done = 0;
 
-    /* A negotiation in progress: trial_cap is the size being tried, 0 when
-     * there is none; trial_end is the block index where the failed range
-     * ends, and trial_failed the size that failed on it. */
+    /* The size the blocks that failed are read again in, 0 when no chunk
+     * has failed: the one way a failure is dealt with, whatever it was. It
+     * only goes down, for this read only. */
+    int split_cap = 0;
+
+    /* When a split was for the bridge's sake, a negotiation is in progress:
+     * trial_cap is the size being tried, 0 when there is none; trial_end is
+     * the block index where the failed range ends, and trial_failed the
+     * size that failed on it. */
     int trial_cap = 0;
     int trial_end = 0;
     int trial_failed = 0;
 
-    /* The size a refusal was narrowed down to, 0 when none: the blocks
-     * before the refused one are read in such chunks, for this read only. */
-    int refusal_cap = 0;
-
-    /* Likewise for a medium error, and when it was first answered, 0 when
-     * none has been. */
-    int medium_cap = 0;
+    /* When a medium error was first answered, 0 when none has been, and
+     * whether one has been split since: the smaller reads are tried once. */
     int64_t medium_since = 0;
+    int medium_split = 0;
 
     while (blocks_done < num_blocks) {
         /* Re-read every time round: another thread on the same drive may
          * have lowered it. */
         int cap = entry != NULL ? entry->max_transfer_bytes
                                 : LASER_MAX_BYTES_PER_TRANSFER;
-        if (trial_cap > 0 && trial_cap < cap) {
-            cap = trial_cap;
-        }
-        if (refusal_cap > 0 && refusal_cap < cap) {
-            cap = refusal_cap;
-        }
-        if (medium_cap > 0 && medium_cap < cap) {
-            cap = medium_cap;
+        if (split_cap > 0 && split_cap < cap) {
+            cap = split_cap;
         }
 
         int max_blocks_per_chunk = cap / block_size;
@@ -462,10 +464,9 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
         }
 
         /* Blocks known not to read: answered without the drive. */
+        const uint32_t at = lba + (uint32_t)blocks_done;
         if (entry != NULL) {
-            const int known = known_bad_block(entry,
-                                              lba + (uint32_t)blocks_done,
-                                              &chunk, refusals);
+            const int known = known_bad_block(entry, at, &chunk, refusals);
             if (known != 0) {
                 return blocks_done > 0 ? blocks_done : known;
             }
@@ -473,7 +474,7 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
 
         uint8_t cdb[16];
         memset(cdb, 0, sizeof(cdb));
-        build_cdb(cdb, lba + (uint32_t)blocks_done, chunk, ctx);
+        build_cdb(cdb, at, chunk, ctx);
 
         int actual_len = 0;
         laser_failure_t why;
@@ -481,7 +482,7 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                 token, cdb, cdb_len,
                 buffer + (size_t)blocks_done * block_size,
                 chunk * block_size, /* data_in = */ 1, &actual_len,
-                medium_cap > 0 || ahead ? 1 : LASER_READ_MAX_MEDIUM_ERRORS,
+                medium_split || ahead ? 1 : LASER_READ_MAX_MEDIUM_ERRORS,
                 ahead ? 1 : LASER_READ_MAX_RESETS,
                 &why);
 
@@ -499,19 +500,6 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                 return (int)st;
             }
 
-            /* A refusal fails the whole command: narrowed down to the
-             * refused block, so that the blocks before it are returned. */
-            if (refusals && !ahead && laser_status_is_positional(st) &&
-                entry != NULL) {
-                if (chunk > 1) {
-                    refusal_cap = (chunk / 2) * block_size;
-                    continue;
-                }
-                remember_refusal(entry, token, lba + (uint32_t)blocks_done,
-                                 (int)st);
-                return blocks_done > 0 ? blocks_done : (int)st;
-            }
-
             /* No CSS session in force: no block is to blame, and those
              * refused may read once libdvdcss authenticates again. */
             if (st == LASER_ERR_NO_KEY && entry != NULL) {
@@ -519,39 +507,49 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                                 "the drive reports no CSS session in force");
             }
 
-            /* Read ahead: one attempt was the whole of it. Whoever wants
-             * these blocks reads them with the patience they are worth. */
-            if (ahead) {
-                return blocks_done > 0 ? blocks_done : (int)st;
-            }
+            /* What the failure calls for, by what it is: the same blocks
+             * again in commands of @c smaller bytes, or what it teaches of
+             * the blocks recorded, or nothing. Then one way out. */
+            const int tried = chunk * block_size;
+            int smaller = 0;
 
-            /* The drive reached the blocks and could not read them: the
-             * same blocks at half the size, so that those before the bad
-             * ones are returned - see "a medium error is narrowed down"
-             * above. The bridge is not to blame: it carried the answer. */
-            if (st == LASER_ERR_IO && why.medium_error && entry != NULL) {
+            if (entry == NULL || ahead) {
+                /* Read ahead: one attempt was the whole of it. Whoever
+                 * wants these blocks reads them with the patience they are
+                 * worth. And nowhere to record without an entry. */
+            } else if (refusals && laser_status_is_positional(st)) {
+                /* A refusal fails the whole command: narrowed down to the
+                 * refused block, so that the blocks before it are
+                 * returned. */
+                if (chunk > 1) {
+                    smaller = (chunk / 2) * block_size;
+                } else {
+                    remember_refusal(entry, token, at, (int)st);
+                }
+            } else if (st == LASER_ERR_IO &&
+                       why.cause == LASER_FAILURE_MEDIUM) {
+                /* The drive reached the blocks and could not read them:
+                 * narrowed down so that those before the bad ones are
+                 * returned - see "a medium error is narrowed down" above.
+                 * The bridge is not to blame: it carried the answer. */
                 const int64_t now = laser_monotonic_ms_now();
                 if (medium_since == 0) {
                     medium_since = now;
                 }
                 if (chunk > LASER_MEDIUM_NARROW_MIN_BLOCKS &&
                     now - medium_since < LASER_MEDIUM_NARROW_MAX_MS) {
-                    medium_cap = (chunk / 2) * block_size;
-                    continue;
+                    smaller = (chunk / 2) * block_size;
+                    medium_split = 1;
+                } else {
+                    remember_unreadable(entry, token, at, chunk);
                 }
-                remember_unreadable(entry, token,
-                                    lba + (uint32_t)blocks_done, chunk);
-                return blocks_done > 0 ? blocks_done : (int)st;
-            }
-
-            /* Maybe the bridge rather than the disc: try the same blocks at
-             * half the size. The first failure of a negotiation sets the
-             * range it must cover. Not when the device has already read
-             * this much in one command: then it is the disc. */
-            const int tried = chunk * block_size;
-            if (st == LASER_ERR_IO && chunk > 1 && entry != NULL &&
-                tried > LASER_MIN_BYTES_PER_TRANSFER &&
-                tried > entry->largest_ok_bytes) {
+            } else if (st == LASER_ERR_IO && chunk > 1 &&
+                       tried > LASER_MIN_BYTES_PER_TRANSFER &&
+                       tried > entry->largest_ok_bytes) {
+                /* Maybe the bridge rather than the disc. The first failure
+                 * of a negotiation sets the range it must cover. Not when
+                 * the device has already read this much in one command:
+                 * then it is the disc, or the drive. */
                 if (trial_cap == 0) {
                     trial_end = blocks_done + chunk;
                     trial_failed = tried;
@@ -560,18 +558,21 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                 if (trial_cap < LASER_MIN_BYTES_PER_TRANSFER) {
                     trial_cap = LASER_MIN_BYTES_PER_TRANSFER;
                 }
-                continue;
+                smaller = trial_cap;
+            } else if (st == LASER_ERR_IO &&
+                       why.cause == LASER_FAILURE_NO_ANSWER) {
+                /* Recorded only when the disc is to blame: here, the drive
+                 * stuck on these blocks, not answering the read. Any other
+                 * LASER_ERR_IO - a drive not ready within its budget, a
+                 * transport failing - says nothing of the blocks, and
+                 * recording them would have every consumer take them for
+                 * unreadable until the disc changes. */
+                remember_unreadable(entry, token, at, chunk);
             }
 
-            /* Recorded only when the disc is to blame: the drive stuck on
-             * these blocks, not answering the read. Any other LASER_ERR_IO
-             * - a drive not ready within its budget, a transport failing -
-             * says nothing of the blocks, and recording them would have
-             * every consumer take them for unreadable until the disc
-             * changes. A medium error was recorded above. */
-            if (st == LASER_ERR_IO && why.no_answer && entry != NULL) {
-                remember_unreadable(entry, token, lba + (uint32_t)blocks_done,
-                                    chunk);
+            if (smaller > 0) {
+                split_cap = smaller;
+                continue;
             }
             return blocks_done > 0 ? blocks_done : (int)st;
         }

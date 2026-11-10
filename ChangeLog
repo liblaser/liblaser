@@ -15,6 +15,7 @@ XXXX-XX-XX: version 0.3.2
     - Do not take a logical unit with no device connected for the drive
     - Report a media poll skipped on a busy drive as such, not as a failure
     - Make the fields read without a lock atomic
+    - Simplifications
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/
