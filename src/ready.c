@@ -77,6 +77,14 @@
 #define SCSI_PDT_MASK           0x1f
 #define SCSI_PDT_DIRECT_ACCESS  0x00
 #define SCSI_PDT_CD_DVD         0x05
+#define SCSI_PDT_UNKNOWN        0x1f
+
+/* And its high 3 bits, the peripheral qualifier: 000b for a device connected
+ * to this logical unit. Anything else says that none is - 011b with type 1Fh
+ * is the answer of a unit that does not exist - and the type beside it then
+ * describes no device. */
+#define SCSI_PQ_SHIFT           5
+#define SCSI_PQ_CONNECTED       0x00
 
 /* INQUIRY allocation length: the 36-byte standard short form every device
  * must answer. */
@@ -575,7 +583,10 @@ void laser_token_settle(int token)
  * at the read timeouts, an absent unit of a multi-LUN device would cost
  * eleven seconds of registration.
  *
- * @param pdt receives the peripheral device type on success.
+ * @param pdt receives the peripheral device type on success -
+ *            SCSI_PDT_UNKNOWN for a unit answering that no device is
+ *            connected to it, whatever type it gives: such a unit is not the
+ *            optical one, and its type no reason to decline the device.
  * @return 0 on success, BOT_FAIL_NO_DEVICE if the device is gone, -1 if the
  *         unit did not answer, INQUIRY_STOPPED if the caller's abort check
  *         said to stop between two attempts.
@@ -598,6 +609,12 @@ static int inquiry_pdt(laser_entry_t *entry, int attempts, uint8_t *pdt)
 
         if (rc == 0 && actual >= 1) {
             *pdt = inq[0] & SCSI_PDT_MASK;
+            if ((inq[0] >> SCSI_PQ_SHIFT) != SCSI_PQ_CONNECTED) {
+                LOGI("token=%d: LUN %u answers that no device is connected "
+                     "to it (INQUIRY byte 0 0x%02x)",
+                     entry->token, entry->lun, inq[0]);
+                *pdt = SCSI_PDT_UNKNOWN;
+            }
             return 0;
         }
 
