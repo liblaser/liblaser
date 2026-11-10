@@ -812,6 +812,33 @@ laser_status_t laser_media_lock(int token, int locked);
 laser_status_t laser_media_eject(int token);
 
 /**
+ * Ask the drive to read no faster than @p times the nominal speed of the
+ * medium it holds - a CD's, a DVD's or a Blu-ray's own "1x" - or, with
+ * @p times 0, to go back to its own choice.
+ *
+ * FOR THE NOISE. A drive left to itself spins a disc as fast as it reads
+ * it, many times what playing it takes. A film needs a little more than
+ * 1x; a Blu-ray up to 1.5x: ask for 2 at least, or the first seek starves
+ * the player.
+ *
+ * A REQUEST, AND NOTHING THE READS DEPEND ON. SET STREAMING is tried, then
+ * SET CD SPEED, which many drives take on a DVD as well. A drive rounds to a
+ * speed it has; some take the command and ignore it; some forget it when the
+ * disc changes or after standing idle. Nothing here reads the speed back.
+ *
+ * The setting is the drive's, not the token's: every consumer reads at it,
+ * and it outlives the registration - give it back, with 0, when done.
+ *
+ * @param token the registry token; a claim must be held.
+ * @param times the multiple of the medium's nominal speed; 0 or less for the
+ *              drive's own.
+ * @return LASER_OK if the drive took either command; LASER_ERR_REFUSED if it
+ *         took neither, or if the medium is not one whose speed is known;
+ *         any other laser_status_t.
+ */
+laser_status_t laser_set_speed(int token, int times);
+
+/**
  * The medium's size in 2048-byte blocks: READ CAPACITY(10).
  *
  * @param num_blocks Set on success: the last block's address plus one.

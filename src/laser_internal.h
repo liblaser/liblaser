@@ -517,6 +517,26 @@ enum {
  */
 int laser_wait_state(int token);
 
+/** What kind of medium the drive holds, by its current profile. */
+typedef enum {
+    /** The drive did not answer, reported no current profile, or reported
+     * one this library does not classify. */
+    LASER_FAMILY_UNKNOWN = 0,
+    LASER_FAMILY_CD,
+    LASER_FAMILY_DVD,
+    LASER_FAMILY_BD,
+} laser_family_t;
+
+/**
+ * Ask the drive for its current profile (MMC GET CONFIGURATION, feature
+ * header bytes 6-7), and log it. This is what tells a CD from a DVD or a BD:
+ * READ TOC cannot, since drives answer it on every medium, making a
+ * single-track TOC up for a DVD or a BD. Pre-MMC-3 drives may not implement
+ * the command, hence LASER_FAMILY_UNKNOWN as a fallback rather than a
+ * verdict. In medium.c.
+ */
+laser_family_t laser_medium_family(int token);
+
 /** Answers of laser_probe_lun(). */
 enum {
     /** INQUIRY says direct-access block device. Not an optical drive. */

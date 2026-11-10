@@ -70,6 +70,143 @@ int laser_gesn_media_locked(laser_entry_t *entry, gesn_media_t *out,
 }
 
 /* ============================================================================
+ * What the medium is, and how fast it is read
+ * ========================================================================= */
+
+/* See laser_internal.h. */
+laser_family_t laser_medium_family(int token)
+{
+    uint8_t cdb[10] = { 0 };
+    cdb[0] = 0x46; /* GET CONFIGURATION */
+    cdb[1] = 0x00; /* RT 00b: every feature, of which only the header is read */
+    cdb[8] = 32;   /* allocation length */
+
+    uint8_t buf[32] = { 0 };
+    int actual_len = 0;
+    laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb),
+                                       buf, sizeof(buf), 1, &actual_len);
+    if (st != LASER_OK || actual_len < 8) {
+        LOGI("token=%d: GET CONFIGURATION unanswered (status %d, %d bytes) - "
+             "medium unknown", token, (int)st, actual_len);
+        return LASER_FAMILY_UNKNOWN;
+    }
+
+    unsigned profile = ((unsigned)buf[6] << 8) | buf[7];
+    laser_family_t family;
+
+    if (profile >= 0x0008 && profile <= 0x000A)      /* CD-ROM, CD-R, CD-RW */
+        family = LASER_FAMILY_CD;
+    else if (profile >= 0x0010 && profile <= 0x002F) /* DVD-ROM ... DVD+R DL */
+        family = LASER_FAMILY_DVD;
+    else if (profile >= 0x0040 && profile <= 0x004F) /* BD-ROM, BD-R, BD-RE */
+        family = LASER_FAMILY_BD;
+    else
+        family = LASER_FAMILY_UNKNOWN;
+
+    LOGI("token=%d: current profile 0x%04x (%s)", token, profile,
+         family == LASER_FAMILY_CD  ? "CD"
+         : family == LASER_FAMILY_DVD ? "DVD"
+         : family == LASER_FAMILY_BD  ? "BD" : "unknown");
+    return family;
+}
+
+/* The nominal read rate of each family, its "1x", in kB/s of 1000 bytes as
+ * the two commands below count: 75 sectors of 2352 bytes a second for a CD,
+ * 11.08 Mbit/s for a DVD, 35.97 Mbit/s for a BD. */
+#define LASER_1X_CD_KB   177
+#define LASER_1X_DVD_KB  1385
+#define LASER_1X_BD_KB   4496
+
+/* SET STREAMING (B6h), one performance descriptor for the whole medium:
+ * @p kb kB a second, or with @p kb 0 the drive's own defaults back (RDD). */
+static laser_status_t set_streaming(int token, uint32_t kb)
+{
+    uint8_t cdb[12] = { 0 };
+    uint8_t desc[28] = { 0 };
+
+    cdb[0]  = 0xb6;             /* SET STREAMING */
+    cdb[8]  = 0x00;             /* type: performance descriptor */
+    cdb[9]  = 0;                /* parameter list length, big-endian */
+    cdb[10] = sizeof(desc);
+
+    if (kb == 0) {
+        desc[0] = 0x04;         /* RDD: restore drive defaults */
+    }
+    /* Start LBA 0, bytes 4-7; end LBA, bytes 8-11: the whole medium. */
+    desc[8] = desc[9] = desc[10] = desc[11] = 0xff;
+    /* Read size, kB, bytes 12-15, per read time, ms, bytes 16-19: a second.
+     * The same for writing, bytes 20-27, as the programs known to send this
+     * command fill them. */
+    desc[12] = desc[20] = (uint8_t)(kb >> 24);
+    desc[13] = desc[21] = (uint8_t)(kb >> 16);
+    desc[14] = desc[22] = (uint8_t)(kb >> 8);
+    desc[15] = desc[23] = (uint8_t)kb;
+    desc[18] = desc[26] = 1000 >> 8;
+    desc[19] = desc[27] = 1000 & 0xff;
+
+    return laser_scsi_cdb(token, cdb, sizeof(cdb), desc, sizeof(desc),
+                          /* data_in = */ 0, NULL);
+}
+
+/* SET CD SPEED (BBh): @p kb kB a second, FFFFh at most, which is also "as
+ * fast as you can". The older command, which many drives take for a DVD
+ * too. */
+static laser_status_t set_cd_speed(int token, uint32_t kb)
+{
+    uint8_t cdb[12] = { 0 };
+    const uint16_t read = kb == 0 || kb > 0xffff ? 0xffff : (uint16_t)kb;
+
+    cdb[0] = 0xbb;              /* SET CD SPEED */
+    cdb[2] = (uint8_t)(read >> 8);
+    cdb[3] = (uint8_t)read;
+    cdb[4] = 0xff;              /* write speed: as fast as it can */
+    cdb[5] = 0xff;
+
+    return laser_scsi_cdb(token, cdb, sizeof(cdb), NULL, 0, 0, NULL);
+}
+
+laser_status_t laser_set_speed(int token, int times)
+{
+    uint32_t kb = 0;
+
+    if (times > 0) {
+        switch (laser_medium_family(token)) {
+        case LASER_FAMILY_CD:  kb = LASER_1X_CD_KB;  break;
+        case LASER_FAMILY_DVD: kb = LASER_1X_DVD_KB; break;
+        case LASER_FAMILY_BD:  kb = LASER_1X_BD_KB;  break;
+        case LASER_FAMILY_UNKNOWN:
+            LOGI("token=%d: read speed not set: the medium is not known",
+                 token);
+            return LASER_ERR_REFUSED;
+        }
+        kb *= (uint32_t)times;
+    }
+
+    laser_status_t st = set_streaming(token, kb);
+    const char *how = "SET STREAMING";
+
+    /* Refused, or failed for a reason of the drive's: the older command.
+     * Not when there is nobody left to ask. */
+    if (st != LASER_OK && st != LASER_ERR_MEDIA_GONE &&
+        st != LASER_ERR_NO_DEVICE && st != LASER_ERR_CANCELLED &&
+        st != LASER_ERR_NO_SUCH_TOKEN) {
+        st = set_cd_speed(token, kb);
+        how = "SET CD SPEED";
+    }
+
+    if (st != LASER_OK) {
+        LOGI("token=%d: read speed not set (status %d): the drive keeps its "
+             "own", token, (int)st);
+    } else if (kb == 0) {
+        LOGI("token=%d: read speed given back to the drive (%s)", token, how);
+    } else {
+        LOGI("token=%d: read speed asked: %dx, %u kB/s (%s)", token, times,
+             (unsigned)kb, how);
+    }
+    return st;
+}
+
+/* ============================================================================
  * DVD region (laser_region_mismatch)
  * ========================================================================= */
 

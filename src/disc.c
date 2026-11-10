@@ -930,46 +930,18 @@ typedef enum {
     MEDIUM_BD,
 } medium_t;
 
-/* Ask for the current profile (MMC GET CONFIGURATION, feature header bytes
- * 6-7). This is what tells a CD from a DVD or a BD: READ TOC cannot, since
- * drives answer it on every medium, making a single-track TOC up for a DVD
- * or a BD. Pre-MMC-3 drives may not implement the command, hence
- * MEDIUM_UNKNOWN as a fallback rather than a verdict. */
+/* The medium's family, as the drive's current profile gives it: see
+ * laser_medium_family(), which asks. */
 static medium_t read_medium(int token)
 {
-    uint8_t cdb[10] = { 0 };
-    cdb[0] = 0x46; /* GET CONFIGURATION */
-    cdb[1] = 0x00; /* RT 00b: every feature, of which only the header is read */
-    cdb[8] = 32;   /* allocation length */
-
-    uint8_t buf[32] = { 0 };
-    int actual_len = 0;
-    laser_status_t st = laser_scsi_cdb(token, cdb, sizeof(cdb),
-                                       buf, sizeof(buf), 1, &actual_len);
-    if (st != LASER_OK || actual_len < 8)
+    switch (laser_medium_family(token))
     {
-        LOGI("token=%d: GET CONFIGURATION unanswered (status %d, %d bytes) - "
-             "medium unknown", token, (int)st, actual_len);
-        return MEDIUM_UNKNOWN;
+        case LASER_FAMILY_CD:      return MEDIUM_CD;
+        case LASER_FAMILY_DVD:     return MEDIUM_DVD;
+        case LASER_FAMILY_BD:      return MEDIUM_BD;
+        case LASER_FAMILY_UNKNOWN: break;
     }
-
-    unsigned profile = ((unsigned)buf[6] << 8) | buf[7];
-    medium_t medium;
-
-    if (profile >= 0x0008 && profile <= 0x000A)      /* CD-ROM, CD-R, CD-RW */
-        medium = MEDIUM_CD;
-    else if (profile >= 0x0010 && profile <= 0x002F) /* DVD-ROM ... DVD+R DL */
-        medium = MEDIUM_DVD;
-    else if (profile >= 0x0040 && profile <= 0x004F) /* BD-ROM, BD-R, BD-RE */
-        medium = MEDIUM_BD;
-    else
-        medium = MEDIUM_UNKNOWN;
-
-    LOGI("token=%d: current profile 0x%04x (%s)", token, profile,
-         medium == MEDIUM_CD  ? "CD"
-         : medium == MEDIUM_DVD ? "DVD"
-         : medium == MEDIUM_BD  ? "BD" : "unknown");
-    return medium;
+    return MEDIUM_UNKNOWN;
 }
 
 /** What READ TOC says about the first track. */
