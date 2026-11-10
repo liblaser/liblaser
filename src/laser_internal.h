@@ -89,7 +89,7 @@ void laser_log(laser_log_level_t level, const char *fmt, ...)
 typedef struct {
     /* Is this slot a live, fully set-up registration? Written last by
      * laser_register(), so a slot under construction - which lasts seconds -
-     * is never found by laser_lookup().
+     * is never found by laser_pin().
      *
      * Written under g_registry_lock, read under g_table_lock. */
     int in_use;
@@ -177,6 +177,12 @@ typedef struct {
      * Written under io_lock, read without it: a reader that misses a change
      * sees it at its next look. */
     unsigned media_generation;
+
+    /* Operations in progress on this entry: laser_pin() and laser_unpin().
+     * The teardown waits for it to fall to 0 before it frees the slot.
+     *
+     * Written and read under g_table_lock. */
+    int pins;
 
     /* Raised by the laser_release() that drops the last claim, just before
      * teardown, and never cleared; the slot is memset afterwards. An
@@ -320,24 +326,34 @@ typedef struct {
 } laser_entry_t;
 
 /**
- * Look up the entry for a token, or NULL if it is not registered.
+ * The entry for a token, pinned, or NULL if it is not registered - or if the
+ * laser_release() dropping its last claim has begun.
  *
- * The pointer stays valid for the life of the registration - entries live in
- * a fixed table - so scsi.c holds it across a whole transaction, provided the
- * caller does not race with the laser_release() dropping the last claim (see
- * laser.h).
+ * The pointer stays valid until laser_unpin(): the teardown waits for every
+ * pin before it frees the slot. So a consumer whose claim is released under
+ * it, from another thread, ends its operation in a live entry - with
+ * LASER_ERR_CANCELLED at its next checkpoint - rather than in a slot zeroed
+ * or given to another device. Pins nest: laser_read_blocks() holds one over
+ * those of its commands.
+ *
+ * NEVER HELD ACROSS A CALL THAT MAY TAKE g_registry_lock - laser_acquire(),
+ * laser_release() - which the teardown holds while it waits.
  *
  * The only way in, apart from laser_acquire(): a command on an unclaimed token
  * is a caller bug, reported as such rather than registering a device nobody
  * will release.
  */
-laser_entry_t *laser_lookup(int token);
+laser_entry_t *laser_pin(int token);
+
+/** Lets go of an entry laser_pin() returned. NULL is accepted, and ignored. */
+void laser_unpin(laser_entry_t *entry);
 
 /**
  * Mark this entry cancelled, and test that mark.
  *
  * Set only by the laser_release() that drops the last claim, just before
- * teardown. Tested without a lock, by the retry loop and the chunk loops
+ * it waits for the operations in flight and tears down. Tested without a
+ * lock, by the retry loop and the chunk loops
  * (see laser_entry_t::cancelled) - not by the spin-up wait, which runs on an
  * entry not yet published, that nothing can cancel.
  */

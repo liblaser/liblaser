@@ -262,14 +262,21 @@ laser_status_t laser_acquire(int token);
  *
  * DROPPING THE LAST CLAIM CANCELS THE TOKEN. An operation still running on
  * another thread gives up at its next checkpoint - between retry attempts,
- * between the chunks of a block read - with LASER_ERR_CANCELLED, and the
- * teardown waits for a transaction already on the wire, which completes
- * within about one phase timeout. The cancellation is not exposed on its
- * own: it is token-wide and sticky, and one consumer of several would
- * disable the drive for all the others.
+ * between the chunks of a block read - with LASER_ERR_CANCELLED, and this
+ * call returns only once every such operation has: the teardown waits for
+ * them, a transaction already on the wire included, which completes within
+ * about one phase timeout. The cancellation is not exposed on its own: it
+ * is token-wide and sticky, and one consumer of several would disable the
+ * drive for all the others.
  *
- * The caller must still ensure that nothing calls into the token after its
- * last release has begun: the registry entry is freed when teardown ends.
+ * So a consumer may use a token under a claim that is not its own, released
+ * from another thread - a poller under its application's claim: a call
+ * caught by the release ends as above, a call made after it answers
+ * LASER_ERR_NO_SUCH_TOKEN. Each consumer holding its own claim remains the
+ * rule: without one, the device may be gone between any two calls.
+ *
+ * NEVER FROM THE ABORT CHECK, nor from the log callback: they run inside
+ * the operations this waits for.
  *
  * A CSS session still open when the last claim goes is logged as an error -
  * a consumer outlived the device it was authenticating against.
@@ -437,8 +444,10 @@ laser_status_t laser_scsi_cdb(int token,
  * @return LASER_OK - and only then must laser_css_session_end() be
  *         called - LASER_ERR_NO_SUCH_TOKEN if no claim is held on the token,
  *         LASER_ERR_INVALID on a NULL @p owner or on a re-entrant begin() by
- *         the same owner, or LASER_ERR_IO if another consumer's session is
- *         still open after LASER_CSS_SESSION_MAX_WAIT_MS.
+ *         the same owner, LASER_ERR_IO if another consumer's session is
+ *         still open after LASER_CSS_SESSION_MAX_WAIT_MS, or
+ *         LASER_ERR_CANCELLED if the last claim on the token was dropped
+ *         while this waited.
  */
 laser_status_t laser_css_session_begin(int token, const void *owner);
 

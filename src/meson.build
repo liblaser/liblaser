@@ -32,7 +32,7 @@ laser_public_symbols = [
 ]
 
 # Our own code, with warnings - the vendored targets are not ours to keep
-# warning-clean. Default visibility: laser_lookup() and laser_bot_send_locked()
+# warning-clean. Default visibility: laser_pin() and laser_bot_send_locked()
 # cross between objects and must survive as far as the partial link.
 laser_warning_args = cc.get_supported_arguments(
     '-Wshadow', '-Wvla', '-Wswitch-enum')
@@ -64,7 +64,7 @@ laser_internal = static_library('laser-own',
 # global to local, asserts the result in both directions, and archives it.
 #
 # The partial link is what makes this possible at all: localizing per object
-# would break laser_lookup(), called across objects, and libusb's files call
+# would break laser_pin(), called across objects, and libusb's files call
 # into each other throughout.
 liblaser = custom_target('liblaser',
     input: [laser_internal, libusb_internal, libudfread_internal],

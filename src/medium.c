@@ -334,17 +334,9 @@ static laser_status_t media_from_unit_ready(laser_entry_t *entry,
     return sense_key == 0xff ? LASER_ERR_IO : LASER_OK;
 }
 
-laser_status_t laser_media_poll(int token, laser_media_status_t *out)
+static laser_status_t media_poll_entry(laser_entry_t *entry, int token,
+                                       laser_media_status_t *out)
 {
-    if (out == NULL) {
-        LOGE("token=%d: laser_media_poll: NULL status", token);
-        return LASER_ERR_INVALID;
-    }
-    memset(out, 0, sizeof(*out));
-
-    laser_entry_t *entry = laser_lookup(token);
-    if (entry == NULL)
-        return LASER_ERR_NO_SUCH_TOKEN;
     if (laser_is_cancelled(entry))
         return LASER_ERR_CANCELLED;
     if (entry->device_gone)
@@ -382,6 +374,26 @@ laser_status_t laser_media_poll(int token, laser_media_status_t *out)
         pthread_mutex_unlock(&entry->io_lock);
         LOGI("token=%d: new medium, readiness to be checked again", token);
     }
+    return st;
+}
+
+laser_status_t laser_media_poll(int token, laser_media_status_t *out)
+{
+    if (out == NULL) {
+        LOGE("token=%d: laser_media_poll: NULL status", token);
+        return LASER_ERR_INVALID;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /* Pinned: a poller often runs under a claim that is its application's,
+     * released from another thread - on an unplug above all, which is when
+     * a poll is most likely to be waiting on the drive. */
+    laser_entry_t *entry = laser_pin(token);
+    if (entry == NULL)
+        return LASER_ERR_NO_SUCH_TOKEN;
+
+    laser_status_t st = media_poll_entry(entry, token, out);
+    laser_unpin(entry);
     return st;
 }
 

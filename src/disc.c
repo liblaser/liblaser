@@ -1014,9 +1014,13 @@ void laser_disc_identify_lang(int token, const char *const *langs,
     /* A drive still not ready would answer every probe below the same way,
      * each after a full retry budget. Why it is not ready - no medium, the
      * tray open, or no answer - is what its wait last found. */
-    laser_entry_t *entry = laser_lookup(token);
-    if (entry == NULL || entry->wait_state != LASER_WAIT_READY) {
-        switch (entry != NULL ? entry->wait_state : LASER_WAIT_NOT_READY) {
+    laser_entry_t *entry = laser_pin(token);
+    const int wait_state = entry != NULL ? entry->wait_state
+                                         : LASER_WAIT_NOT_READY;
+    laser_unpin(entry);
+
+    if (wait_state != LASER_WAIT_READY) {
+        switch (wait_state) {
             case LASER_WAIT_NO_MEDIUM:
                 out->state = LASER_DISC_STATE_NO_MEDIUM;
                 break;

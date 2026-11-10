@@ -143,43 +143,100 @@ int laser_parse_token(const char *str, int *token)
 
 static laser_entry_t g_entries[LASER_MAX_DEVICES];
 
-/** Guards the bookkeeping of g_entries (in_use, token), not USB I/O, which
- * entry->io_lock serializes. Held only briefly, never across I/O. */
+/** Guards the bookkeeping of g_entries (in_use, token, pins), not USB I/O,
+ * which entry->io_lock serializes. Held only briefly, never across I/O. */
 static pthread_mutex_t g_table_lock = PTHREAD_MUTEX_INITIALIZER;
 
-laser_entry_t *laser_lookup(int token)
-{
-    laser_entry_t *found = NULL;
+/** Signalled when an entry's last pin goes: the teardown waits for it. */
+static pthread_cond_t g_table_unpinned = PTHREAD_COND_INITIALIZER;
 
-    pthread_mutex_lock(&g_table_lock);
+/** The entry registered under @p token, or NULL. Caller MUST hold
+ * g_table_lock. in_use is set last by laser_register(), so a half-built
+ * entry is never found. */
+static laser_entry_t *find_entry_locked(int token)
+{
     for (int i = 0; i < LASER_MAX_DEVICES; i++) {
-        /* in_use is set last by laser_register(), so a half-built entry is
-         * never found. */
         if (g_entries[i].in_use && g_entries[i].token == token) {
-            found = &g_entries[i];
-            break;
+            return &g_entries[i];
         }
+    }
+    return NULL;
+}
+
+/** The entry registered under @p token, for laser_acquire() and
+ * laser_release(): they hold g_registry_lock, under which no entry is torn
+ * down, and need no pin. */
+static laser_entry_t *laser_lookup(int token)
+{
+    pthread_mutex_lock(&g_table_lock);
+    laser_entry_t *found = find_entry_locked(token);
+    pthread_mutex_unlock(&g_table_lock);
+
+    return found;
+}
+
+laser_entry_t *laser_pin(int token)
+{
+    pthread_mutex_lock(&g_table_lock);
+    laser_entry_t *found = find_entry_locked(token);
+    /* Not once its teardown has begun: the wait for the pins must end. */
+    if (found != NULL && found->cancelled) {
+        found = NULL;
+    }
+    if (found != NULL) {
+        found->pins++;
     }
     pthread_mutex_unlock(&g_table_lock);
 
     return found;
 }
 
+void laser_unpin(laser_entry_t *entry)
+{
+    if (entry == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_table_lock);
+    if (--entry->pins == 0) {
+        pthread_cond_broadcast(&g_table_unpinned);
+    }
+    pthread_mutex_unlock(&g_table_lock);
+}
+
+/** Waits until nothing uses @p entry any more. Its cancellation must have
+ * been raised, so that no new pin is taken and the operations in flight give
+ * up at their next checkpoint. Caller MUST hold g_registry_lock. */
+static void wait_unpinned(laser_entry_t *entry)
+{
+    pthread_mutex_lock(&g_table_lock);
+    while (entry->pins > 0) {
+        pthread_cond_wait(&g_table_unpinned, &g_table_lock);
+    }
+    pthread_mutex_unlock(&g_table_lock);
+}
+
 int laser_token_not_ready(int token)
 {
-    laser_entry_t *entry = laser_lookup(token);
-    return entry != NULL && entry->wait_state != LASER_WAIT_READY;
+    laser_entry_t *entry = laser_pin(token);
+    const int not_ready = entry != NULL &&
+                          entry->wait_state != LASER_WAIT_READY;
+    laser_unpin(entry);
+    return not_ready;
 }
 
 unsigned laser_media_generation(int token)
 {
-    laser_entry_t *entry = laser_lookup(token);
-    return entry != NULL ? entry->media_generation : 0;
+    laser_entry_t *entry = laser_pin(token);
+    const unsigned generation = entry != NULL ? entry->media_generation : 0;
+    laser_unpin(entry);
+    return generation;
 }
 
-/** Accessors of laser_entry_t::cancelled. The write takes the table lock so
- * that it cannot race with release_slot()'s memset. The read takes none: it
- * is on the transaction path, and the flag only ever goes from 0 to 1. */
+/** Accessors of laser_entry_t::cancelled. The write takes the table lock,
+ * under which laser_pin() reads it: no pin is taken once it is raised. The
+ * other reads take none: they are on the transaction path, and the flag only
+ * ever goes from 0 to 1. */
 void laser_set_cancelled(laser_entry_t *entry)
 {
     pthread_mutex_lock(&g_table_lock);
@@ -511,9 +568,11 @@ static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
  *
  * LOCK ORDER. Every nesting has g_registry_lock outside:
  *
- *     g_registry_lock  >  io_lock        (setup, and teardown's drain)
- *     g_registry_lock  >  css_mtx        (teardown: is a session open?)
- *     g_registry_lock  >  g_table_lock   (publish an entry, release a slot)
+ *     g_registry_lock  >  io_lock        (setup, and teardown)
+ *     g_registry_lock  >  css_mtx        (teardown: wake a begin() waiting,
+ *                                         is a session open?)
+ *     g_registry_lock  >  g_table_lock   (publish an entry, release a slot,
+ *                                         wait for its pins)
  *
  * No other pair nests, in either direction. laser_scsi_cdb() releases css_mtx
  * after its session check, before taking io_lock. An open session is a flag,
@@ -584,7 +643,7 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
     }
 
     /* A session needs a claim; begin() registers nothing. */
-    laser_entry_t *entry = laser_lookup(token);
+    laser_entry_t *entry = laser_pin(token);
     if (entry == NULL) {
         LOGW("css_session_begin(token=%d): not registered - no claim held?",
              token);
@@ -602,7 +661,15 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
             pthread_mutex_unlock(&entry->css_mtx);
             LOGE("css_session_begin(token=%d, usb %04x:%04x): this owner "
                  "already holds the session", token, entry->vid, entry->pid);
+            laser_unpin(entry);
             return LASER_ERR_INVALID;
+        }
+        /* The last claim was dropped while this waited: the teardown woke
+         * it, and waits for it to let go of the entry. */
+        if (laser_is_cancelled(entry)) {
+            pthread_mutex_unlock(&entry->css_mtx);
+            laser_unpin(entry);
+            return LASER_ERR_CANCELLED;
         }
         if (pthread_cond_timedwait(&entry->css_cv, &entry->css_mtx,
                                    &deadline) == ETIMEDOUT) {
@@ -614,6 +681,7 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
                  "leaked it; CSS unavailable for this attempt",
                  token, entry->vid, entry->pid,
                  LASER_CSS_SESSION_MAX_WAIT_MS);
+            laser_unpin(entry);
             return LASER_ERR_IO;
         }
     }
@@ -622,13 +690,14 @@ laser_status_t laser_css_session_begin(int token, const void *owner)
     entry->css_owner = owner;
     pthread_mutex_unlock(&entry->css_mtx);
 
+    laser_unpin(entry);
     return LASER_OK;
 }
 
 void laser_css_session_end(int token, const void *owner)
 {
     /* A session cannot exist on an unregistered token. */
-    laser_entry_t *entry = laser_lookup(token);
+    laser_entry_t *entry = laser_pin(token);
     if (entry == NULL) {
         LOGW("css_session_end(token=%d): not registered", token);
         return;
@@ -639,24 +708,23 @@ void laser_css_session_end(int token, const void *owner)
         pthread_mutex_unlock(&entry->css_mtx);
         LOGE("css_session_end(token=%d, usb %04x:%04x): no session for this "
              "owner - unbalanced end(), ignored", token, entry->vid, entry->pid);
+        laser_unpin(entry);
         return;
     }
     entry->css_open  = 0;
     entry->css_owner = NULL;
     pthread_cond_signal(&entry->css_cv);
     pthread_mutex_unlock(&entry->css_mtx);
+    laser_unpin(entry);
 }
 
 /** Tear an entry down. Caller MUST hold g_registry_lock; the last claim must
- * be gone and the entry already cancelled.
+ * be gone, the entry cancelled, and nothing left using it (wait_unpinned()):
+ * the slot is freed here, and whoever still held the entry would go on in a
+ * slot zeroed, or given to another device.
  *
- * io_lock is held while the device is reset and the handle closed. A
- * transaction in flight on another thread therefore completes first - within
- * about one phase timeout, since the cancellation stops its retries - and a
- * thread queued on io_lock only gets it after the close, sees the
- * cancellation and returns without touching libusb. A thread that still uses
- * the entry after release_slot() remains the caller's to prevent, as laser.h
- * says. */
+ * io_lock is taken all the same while the device is reset and the handle
+ * closed: it costs nothing, and it is what the transport is used under. */
 static void teardown_entry_locked(laser_entry_t *entry)
 {
     int token = entry->token;
@@ -781,10 +849,21 @@ void laser_release(int token)
     }
 
     /* Last claim gone. Cancel first, so that an operation still running on
-     * another thread abandons its remaining attempts, then tear down. The
-     * flag is sticky and token-wide, which is why only the last release may
-     * raise it. */
+     * another thread abandons its remaining attempts and no other starts,
+     * wait for those to return, then tear down. The flag is sticky and
+     * token-wide, which is why only the last release may raise it.
+     *
+     * Such an operation is a consumer using the token under a claim that is
+     * not its own - a poller relying on its application's claim, released
+     * from another thread. It returns within one transaction, a phase
+     * timeout at most; one waiting for a CSS session is woken. */
     laser_set_cancelled(entry);
+
+    pthread_mutex_lock(&entry->css_mtx);
+    pthread_cond_broadcast(&entry->css_cv);
+    pthread_mutex_unlock(&entry->css_mtx);
+
+    wait_unpinned(entry);
 
     teardown_entry_locked(entry);
     pthread_mutex_unlock(&g_registry_lock);

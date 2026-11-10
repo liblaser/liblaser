@@ -278,8 +278,12 @@ void laser_forget_disc(laser_entry_t *entry, int token)
 
 int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks)
 {
-    laser_entry_t *entry = laser_lookup(token);
-    if (entry == NULL || num_blocks <= 0) {
+    if (num_blocks <= 0) {
+        return 0;
+    }
+
+    laser_entry_t *entry = laser_pin(token);
+    if (entry == NULL) {
         return 0;
     }
 
@@ -296,12 +300,13 @@ int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks)
     }
     pthread_mutex_unlock(&entry->io_lock);
 
+    laser_unpin(entry);
     return count;
 }
 
 int laser_refused_for_good(int token, uint32_t lba)
 {
-    laser_entry_t *entry = laser_lookup(token);
+    laser_entry_t *entry = laser_pin(token);
     if (entry == NULL) {
         return 0;
     }
@@ -317,6 +322,7 @@ int laser_refused_for_good(int token, uint32_t lba)
     }
     pthread_mutex_unlock(&entry->io_lock);
 
+    laser_unpin(entry);
     return latched;
 }
 
@@ -379,6 +385,10 @@ int laser_refused_for_good(int token, uint32_t lba)
  * most, and never after a drive that did not answer at all: a protection's
  * unreadable sectors are those, each costing the drive a timeout.
  *
+ * @param entry      the token's entry, pinned by the caller, for the
+ *                   transfer cap and the blocks known not to read; NULL for
+ *                   a token not registered, which costs only those:
+ *                   laser_scsi_cdb() looks the token up again and reports it
  * @param token      registry token; the caller must hold a claim on it
  * @param lba        first block to read
  * @param num_blocks how many to read; <= 0 reads nothing and succeeds
@@ -401,19 +411,12 @@ int laser_refused_for_good(int token, uint32_t lba)
  *                   are returned, and the blocks already known not to read
  *                   are answered without the drive, as for any read.
  */
-static int read_chunked(int token, uint32_t lba, int num_blocks,
-                        int block_size, int cdb_len,
-                        build_read_cdb_fn build_cdb, const void *ctx,
-                        uint8_t *buffer, const char *what, int refusals,
-                        int *invalid_field, int ahead)
+static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
+                              int num_blocks, int block_size, int cdb_len,
+                              build_read_cdb_fn build_cdb, const void *ctx,
+                              uint8_t *buffer, const char *what, int refusals,
+                              int *invalid_field, int ahead)
 {
-    if (num_blocks <= 0) {
-        return 0;
-    }
-
-    /* For the transfer cap. A miss costs only the negotiation:
-     * laser_scsi_cdb() looks the token up again and reports it. */
-    laser_entry_t *entry = laser_lookup(token);
     int blocks_done = 0;
 
     /* A negotiation in progress: trial_cap is the size being tried, 0 when
@@ -606,6 +609,27 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
     return blocks_done;
 }
 
+/* read_chunked_entry(), on the entry of @p token, pinned for the whole read:
+ * between two chunks the entry is otherwise nobody's, and a release from
+ * another thread would free it under the tables this reads and writes. */
+static int read_chunked(int token, uint32_t lba, int num_blocks,
+                        int block_size, int cdb_len,
+                        build_read_cdb_fn build_cdb, const void *ctx,
+                        uint8_t *buffer, const char *what, int refusals,
+                        int *invalid_field, int ahead)
+{
+    if (num_blocks <= 0) {
+        return 0;
+    }
+
+    laser_entry_t *entry = laser_pin(token);
+    int r = read_chunked_entry(entry, token, lba, num_blocks, block_size,
+                               cdb_len, build_cdb, ctx, buffer, what,
+                               refusals, invalid_field, ahead);
+    laser_unpin(entry);
+    return r;
+}
+
 static void build_read10_cdb(uint8_t *cdb, uint32_t lba, int blocks,
                              const void *ctx)
 {
@@ -721,7 +745,7 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
             return (int)LASER_ERR_INVALID;
     }
 
-    laser_entry_t *entry = laser_lookup(token);
+    laser_entry_t *entry = laser_pin(token);
     const int audio = sector_type == LASER_CD_SECTOR_AUDIO;
     if (audio && entry != NULL && entry->cdda_any_type) {
         expected_type = 0x00;
@@ -748,5 +772,6 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
                          0);
     }
 
+    laser_unpin(entry);
     return r;
 }

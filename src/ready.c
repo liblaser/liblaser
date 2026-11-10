@@ -469,10 +469,9 @@ void laser_wait_until_ready(laser_entry_t *entry)
  * A drive whose wait already ran out ("never became ready") is checked once
  * more but not waited for again: ready now, its state is ready; still not
  * ready, it keeps it - a new medium resets it too (laser_media_poll()). */
-void laser_token_settle(int token)
+static void settle_entry(laser_entry_t *entry, int token)
 {
-    laser_entry_t *entry = laser_lookup(token);
-    if (entry == NULL || entry->device_gone || laser_is_cancelled(entry))
+    if (entry->device_gone || laser_is_cancelled(entry))
         return;
 
     pthread_mutex_lock(&entry->io_lock);
@@ -523,6 +522,17 @@ void laser_token_settle(int token)
     LOGI("token=%d: registered drive not ready - disc changed or still "
          "loading, waiting for it", token);
     laser_wait_until_ready(entry);
+}
+
+void laser_token_settle(int token)
+{
+    /* Pinned for the whole of it, the wait included. */
+    laser_entry_t *entry = laser_pin(token);
+    if (entry == NULL)
+        return;
+
+    settle_entry(entry, token);
+    laser_unpin(entry);
 }
 
 /* One INQUIRY on the unit selected by entry->lun, under the probe timeouts:

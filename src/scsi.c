@@ -380,8 +380,8 @@ laser_status_t laser_scsi_cdb_read(int token,
 
     /* A lookup, never a registration: a command on an unclaimed token is a
      * caller bug, and registering here would create an entry nobody
-     * releases. */
-    laser_entry_t *entry = laser_lookup(token);
+     * releases. Pinned until every return below. */
+    laser_entry_t *entry = laser_pin(token);
     if (entry == NULL) {
         LOGW("token=%d: no such token - is a claim held? "
              "(laser_acquire() is what registers a device)", token);
@@ -403,16 +403,19 @@ laser_status_t laser_scsi_cdb_read(int token,
              "session open - refused. Call laser_css_session_begin() "
              "first; see the session contract in laser.h",
              token, entry->vid, entry->pid, cdb[0]);
+        laser_unpin(entry);
         return LASER_ERR_INVALID;
     }
 
     /* Before queueing on io_lock, so that a command arriving during teardown
      * does not first wait out the transaction in progress. */
     if (laser_must_stop(entry)) {
+        laser_unpin(entry);
         return LASER_ERR_CANCELLED;
     }
 
     if (entry->device_gone) {
+        laser_unpin(entry);
         return LASER_ERR_NO_DEVICE;
     }
 
@@ -799,6 +802,7 @@ laser_status_t laser_scsi_cdb_read(int token,
     }
 
     pthread_mutex_unlock(&entry->io_lock);
+    laser_unpin(entry);
     return result;
 }
 
