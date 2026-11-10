@@ -196,6 +196,8 @@ int laser_bot_send_locked(laser_entry_t *entry,
     /* Bytes the data phase moved, kept apart from `transferred`, which the
      * CSW read reuses, to bound the residue afterwards. */
     int data_transferred = 0;
+    /* The device sent its CSW where the data was expected: see below. */
+    int csw_in_data = 0;
     int ret;
 
     if (csw_status) {
@@ -334,13 +336,62 @@ int laser_bot_send_locked(laser_entry_t *entry,
             *actual_len = transferred;
         }
         data_transferred = transferred;
+
+        /* A device failing a command it has no data for must stall the
+         * Bulk-In pipe, or pad (BBB 6.7.2, cases 4 and 5). Some send the CSW
+         * at once instead, where the data was expected: thirteen bytes
+         * carrying its signature and this command's tag, which no data does
+         * by chance. Read as data, they left the CSW read below waiting for
+         * one already taken - a timeout, then a Reset Recovery that also
+         * threw away the sense saying why the command failed. Linux takes
+         * them for the CSW too (usb-storage, "Device skipped data phase"). */
+        if (data_in && ret == LIBUSB_SUCCESS &&
+            transferred == USB_BOT_CSW_SIZE && data_len > USB_BOT_CSW_SIZE) {
+            bot_csw_t early;
+            memcpy(&early, data, USB_BOT_CSW_SIZE);
+            if (early.dCSWSignature == USB_BOT_CSW_SIGNATURE &&
+                early.dCSWTag == cbw.dCBWTag) {
+                if (!entry->csw_in_data_quirk_logged) {
+                    entry->csw_in_data_quirk_logged = 1;
+                    LOG_QUIRK(entry, "CSW sent in place of the data phase, "
+                                     "taking it as the status (further "
+                                     "occurrences not logged)");
+                }
+                memcpy(csw_buf, data, USB_BOT_CSW_SIZE);
+                csw_in_data = 1;
+                data_transferred = 0;
+                if (actual_len) {
+                    *actual_len = 0;
+                }
+            }
+        }
     } else if (actual_len) {
         *actual_len = 0;
     }
 
-    ret = libusb_bulk_transfer(entry->handle, entry->ep_in,
-                               csw_buf, USB_BOT_CSW_SIZE, &transferred,
-                               csw_timeout);
+    if (csw_in_data) {
+        /* Already read: the checks below see a whole CSW. */
+        ret = LIBUSB_SUCCESS;
+        transferred = USB_BOT_CSW_SIZE;
+    } else {
+        ret = libusb_bulk_transfer(entry->handle, entry->ep_in,
+                                   csw_buf, USB_BOT_CSW_SIZE, &transferred,
+                                   csw_timeout);
+        /* An empty packet where the CSW should be: some devices end their
+         * data with one more than they should, and the CSW is behind it.
+         * Read once more, as Linux does, rather than reset a device that
+         * is about to answer. */
+        if (ret == LIBUSB_SUCCESS && transferred == 0) {
+            if (!entry->csw_empty_quirk_logged) {
+                entry->csw_empty_quirk_logged = 1;
+                LOG_QUIRK(entry, "empty packet before the CSW, reading it "
+                                 "again (further occurrences not logged)");
+            }
+            ret = libusb_bulk_transfer(entry->handle, entry->ep_in,
+                                       csw_buf, USB_BOT_CSW_SIZE,
+                                       &transferred, csw_timeout);
+        }
+    }
     if (ret == LIBUSB_ERROR_PIPE) {
         /* BBB 6.7.3 gives a stalled status phase one more chance: clear the
          * halt and read the CSW again. Only a second failure calls for a

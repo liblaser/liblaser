@@ -264,6 +264,10 @@ typedef struct {
      * reported once, not on every command. */
     int residue_quirk_logged;
     int csw_stall_quirk_logged;
+    /* Likewise for a status sent where the data was expected, and for an
+     * empty packet before the status: see laser_bot_send_locked(). */
+    int csw_in_data_quirk_logged;
+    int csw_empty_quirk_logged;
 
     /** Nonzero while a probe - a command needing no medium, INQUIRY today -
      * is in flight: shortens the BOT phase timeouts. Set and cleared around

@@ -10,6 +10,7 @@ XXXX-XX-XX: version 0.3.2
     - Wait for the operations in flight before tearing a device down
     - Let the abort check end the wait for a drive to become ready
     - Pad command blocks to 12 bytes on ATAPI-subclass interfaces
+    - Accept a status sent in place of the data, or behind an empty packet
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/
