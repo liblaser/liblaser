@@ -506,6 +506,7 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
 
         int actual_len = 0;
         laser_failure_t why;
+        const int64_t sent_at = entry != NULL ? laser_monotonic_ms_now() : 0;
         laser_status_t st = laser_scsi_cdb_read(
                 token, cdb, cdb_len,
                 buffer + (size_t)blocks_done * block_size,
@@ -513,6 +514,17 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                 medium_split || ahead ? 1 : LASER_READ_MAX_MEDIUM_ERRORS,
                 ahead ? 1 : LASER_READ_MAX_RESETS,
                 &why);
+
+        if (entry != NULL) {
+            const unsigned ms = (unsigned)(laser_monotonic_ms_now() - sent_at);
+            atomic_fetch_add(&entry->reads_sent, 1);
+            atomic_fetch_add(&entry->reads_blocks, (unsigned)chunk);
+            atomic_fetch_add(&entry->reads_ms, ms);
+            if (st != LASER_OK)
+                atomic_fetch_add(&entry->reads_failed, 1);
+            if (ms > atomic_load(&entry->reads_longest_ms))
+                atomic_store(&entry->reads_longest_ms, ms);
+        }
 
         if (st != LASER_OK) {
             if (st == LASER_ERR_REFUSED && invalid_field != NULL &&

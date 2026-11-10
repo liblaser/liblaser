@@ -362,6 +362,15 @@ typedef struct {
      * a while after it (see poll_lock() in medium.c). Written and read under
      * io_lock. */
     int64_t         last_failure_ms;
+
+    /* The read commands sent since a consumer last came or went, for the
+     * log of the next one to go: see laser_log_reads(). Counted without a
+     * lock, by commands the drive takes one at a time. */
+    atomic_uint     reads_sent;
+    atomic_uint     reads_failed;
+    atomic_uint     reads_blocks;
+    atomic_uint     reads_ms;
+    atomic_uint     reads_longest_ms;
 } laser_entry_t;
 
 /**

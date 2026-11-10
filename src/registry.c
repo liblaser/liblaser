@@ -819,6 +819,27 @@ static int fd_still_ours(const laser_entry_t *entry, int fd)
     return st.st_dev == entry->reg_dev && st.st_ino == entry->reg_ino;
 }
 
+/* Logs the read commands sent to the drive since a consumer last came or
+ * went, and starts the count again: what a classification, or a stream,
+ * cost the drive - how many commands, and how long it took over them, the
+ * longest being a seek or a sector read with difficulty. With several
+ * consumers reading at once, the count is of them all.
+ *
+ * Caller MUST hold g_registry_lock. */
+static void log_reads(laser_entry_t *entry, int token)
+{
+    const unsigned sent    = atomic_exchange(&entry->reads_sent, 0);
+    const unsigned failed  = atomic_exchange(&entry->reads_failed, 0);
+    const unsigned blocks  = atomic_exchange(&entry->reads_blocks, 0);
+    const unsigned ms      = atomic_exchange(&entry->reads_ms, 0);
+    const unsigned longest = atomic_exchange(&entry->reads_longest_ms, 0);
+
+    if (sent != 0)
+        LOGI("token=%d: %u read commands (%u failed) for %u blocks, %u ms in "
+             "the drive, the longest %u ms", token, sent, failed, blocks, ms,
+             longest);
+}
+
 laser_status_t laser_acquire(int token)
 {
     /* One critical section for lookup, registration and increment: a release
@@ -857,6 +878,9 @@ laser_status_t laser_acquire(int token)
     int refs = entry->refs;
     int vid = entry->vid, pid = entry->pid;
 
+    /* What the consumers already there read so far is not this one's. */
+    log_reads(entry, token);
+
     pthread_mutex_unlock(&g_registry_lock);
 
     LOGI("acquire(token=%d, usb %04x:%04x): %d consumer(s)",
@@ -886,6 +910,8 @@ void laser_release(int token)
              "unbalanced release, ignored", token, entry->vid, entry->pid);
         return;
     }
+
+    log_reads(entry, token);
 
     entry->refs--;
     if (entry->refs > 0) {
