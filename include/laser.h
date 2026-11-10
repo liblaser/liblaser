@@ -174,6 +174,19 @@ typedef enum {
      * Unlike LASER_ERR_IO, it must not be retried.
      */
     LASER_ERR_NO_DEVICE = -10,
+
+    /**
+     * laser_acquire() only: the device is no optical drive - INQUIRY says
+     * so on every logical unit, a card reader or a USB key, or it has no
+     * Bulk-Only mass storage interface at all. Nothing was registered, and
+     * the kernel driver the claim detached is back.
+     *
+     * Unlike LASER_ERR_NO_SUCH_TOKEN for a device that could not be set up -
+     * one answering no INQUIRY, as a drive still busy or underpowered does -
+     * this is the device's answer, and the next claim gets the same one: a
+     * consumer may stop offering it as a drive until it is unplugged.
+     */
+    LASER_ERR_NOT_OPTICAL = -11,
 } laser_status_t;
 
 /* ============================================================================
@@ -227,9 +240,10 @@ int laser_parse_token(const char *str, int *token);
  * error: re-registering would take the drive from a consumer that never let
  * go.
  *
- * @return LASER_OK - and only then must laser_release() be called - or
- *         LASER_ERR_NO_SUCH_TOKEN if the device could not be set up, or if
- *         the descriptor no longer names the device registered under it.
+ * @return LASER_OK - and only then must laser_release() be called -
+ *         LASER_ERR_NOT_OPTICAL if the device is no optical drive, or
+ *         LASER_ERR_NO_SUCH_TOKEN if it could not be set up, or if the
+ *         descriptor no longer names the device registered under it.
  */
 laser_status_t laser_acquire(int token);
 

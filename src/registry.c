@@ -268,11 +268,15 @@ static void reattach_kernel_driver(laser_entry_t *entry)
  * endpoints, claim, Mass Storage Reset, optical LUN, spin-up wait. Reachable
  * only from laser_acquire().
  *
- * @return the entry, published; NULL if the device could not be set up.
+ * @return the entry, published; NULL if the device could not be set up, and
+ *         then why in @p why: LASER_ERR_NOT_OPTICAL for a device that is no
+ *         optical drive, LASER_ERR_NO_SUCH_TOKEN for anything else.
  *
  * Caller MUST hold g_registry_lock. */
-static laser_entry_t *laser_register(int fd)
+static laser_entry_t *laser_register(int fd, laser_status_t *why)
 {
+    *why = LASER_ERR_NO_SUCH_TOKEN;
+
     laser_entry_t *entry = reserve_slot(fd);
     if (entry == NULL) {
         LOGW("register(fd=%d): already registered, or table full", fd);
@@ -368,6 +372,7 @@ static laser_entry_t *laser_register(int fd)
         LOGW("register(fd=%d, usb %04x:%04x bcd %04x): no usable Bulk-Only "
              "mass storage interface - not an optical drive?",
              fd, entry->vid, entry->pid, entry->bcd_device);
+        *why = LASER_ERR_NOT_OPTICAL;
         goto err_handle;
     }
 
@@ -425,6 +430,7 @@ static laser_entry_t *laser_register(int fd)
     if (optical == LASER_OPTICAL_NO) {
         LOGI("register(fd=%d, usb %04x:%04x): not an optical drive, "
              "declining", fd, entry->vid, entry->pid);
+        *why = LASER_ERR_NOT_OPTICAL;
         goto err_iface;
     }
 
@@ -713,13 +719,17 @@ laser_status_t laser_acquire(int token)
         return LASER_ERR_NO_SUCH_TOKEN;
     }
 
+    laser_status_t why = LASER_ERR_NO_SUCH_TOKEN;
     if (entry == NULL)
-        entry = laser_register(token);
+        entry = laser_register(token, &why);
 
     if (entry == NULL) {
         pthread_mutex_unlock(&g_registry_lock);
-        LOGW("acquire(token=%d): could not register the device", token);
-        return LASER_ERR_NO_SUCH_TOKEN;
+        if (why == LASER_ERR_NOT_OPTICAL)
+            LOGI("acquire(token=%d): not an optical drive", token);
+        else
+            LOGW("acquire(token=%d): could not register the device", token);
+        return why;
     }
 
     entry->refs++;
