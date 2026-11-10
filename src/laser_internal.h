@@ -117,8 +117,9 @@ typedef struct {
      *
      * Starts at LASER_MAX_BYTES_PER_TRANSFER and only ever shrinks, never
      * below LASER_MIN_BYTES_PER_TRANSFER: lowered when smaller transfers read
-     * the whole range a larger one failed on, which shows the limit to be the
-     * bridge's rather than the disc's (see read_chunked() in read.c). Kept
+     * the whole range a larger one failed on, twice, which shows the limit to
+     * be the bridge's rather than the disc's or a passing failure's (see
+     * read_chunked() and lower_transfer_cap() in read.c). Kept
      * here rather than in a consumer, so that every consumer of the token
      * benefits.
      *
@@ -142,6 +143,11 @@ typedef struct {
      * learnt_lock, read without it: a stale read negotiates once for
      * nothing. */
     atomic_int largest_ok_bytes;
+
+    /* The size of a transfer that failed once where smaller ones read the
+     * same blocks, 0 if none has: the cap is lowered the second time, see
+     * lower_transfer_cap() in read.c. Under learnt_lock. */
+    int cap_strike_bytes;
 
     /* Runs of blocks the disc could not be read in - a read failing with
      * LASER_ERR_IO on the disc, the drive answering with a medium error or

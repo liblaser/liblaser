@@ -503,12 +503,12 @@ void laser_css_session_end(int token, const void *owner);
  * a 64 KiB data phase outright, where the same blocks read in smaller
  * commands go through. So a chunk that fails with LASER_ERR_IO is read again
  * at half the size, halving down to an 8 KiB floor; once smaller transfers
- * have read the whole range the larger one failed on, the smaller size is
- * kept for the device, for every consumer of the token. A scratch fails the
- * smaller reads too, and leaves the size alone.
+ * have read the whole range the larger one failed on, and this has happened
+ * twice, the smaller size is kept for the device, for every consumer of the
+ * token. A scratch fails the smaller reads too, and leaves the size alone.
  *
- * So the first read on a weak bridge is slower than the next ones, and an
- * unreadable sector costs a few extra commands before it is reported.
+ * So the first two reads on a weak bridge are slower than the next ones, and
+ * an unreadable sector costs a few extra commands before it is reported.
  *
  * A MEDIUM ERROR IS NARROWED DOWN THE SAME WAY. When the drive answers that
  * it could not read a sector - its own retries spent, as on a scratch - the

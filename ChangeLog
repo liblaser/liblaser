@@ -17,6 +17,7 @@ XXXX-XX-XX: version 0.3.2
     - Make the fields read without a lock atomic
     - Simplifications
     - Answer what is known of a block without waiting for the drive
+    - Lower the transfer size of a device only once a failure has repeated
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/

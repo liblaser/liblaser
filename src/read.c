@@ -62,24 +62,49 @@ static void raise_largest_ok(laser_entry_t *entry, int bytes)
     if (bytes > entry->largest_ok_bytes) {
         entry->largest_ok_bytes = bytes;
     }
+    /* The size that failed once has now read: it was not the bridge. */
+    if (bytes >= entry->cap_strike_bytes) {
+        entry->cap_strike_bytes = 0;
+    }
     pthread_mutex_unlock(&entry->learnt_lock);
 }
 
 /* Lower this device's transfer cap to @p bytes, if it is above that. Called
  * once smaller transfers have read the whole range a @p failed_bytes one
- * failed on. */
+ * failed on.
+ *
+ * THE SECOND TIME ONLY. The cap never goes back up, and one such failure
+ * proves little: the first large read after a drive is set up is the likeliest
+ * to fail for a reason that has passed by the time the smaller ones are sent,
+ * a drive still settling, and it used to halve every command of the
+ * registration. The first time is only noted. A bridge that has the limit
+ * fails the next large read too, which lowers the cap, at the cost of that
+ * one transfer; a large read that succeeds meanwhile clears the note
+ * (raise_largest_ok()). */
 static void lower_transfer_cap(laser_entry_t *entry, int bytes,
                                int failed_bytes)
 {
     pthread_mutex_lock(&entry->learnt_lock);
 
-    const int lowered = bytes < entry->max_transfer_bytes;
-    if (lowered) {
+    const int first = entry->cap_strike_bytes == 0 &&
+                      bytes < entry->max_transfer_bytes;
+    int lowered = 0;
+    if (first) {
+        entry->cap_strike_bytes = failed_bytes;
+    } else if (bytes < entry->max_transfer_bytes) {
         entry->max_transfer_bytes = bytes;
+        entry->cap_strike_bytes = 0;
+        lowered = 1;
     }
 
     pthread_mutex_unlock(&entry->learnt_lock);
 
+    if (first) {
+        LOG_QUIRK(entry, "a %d-byte transfer failed where %d-byte ones read "
+                         "the same blocks - the device is limited to that if "
+                         "it happens again",
+                  failed_bytes, bytes);
+    }
     if (lowered) {
         LOG_QUIRK(entry, "a %d-byte transfer failed where %d-byte ones read "
                          "the same blocks, limiting this device to %d bytes "
@@ -353,9 +378,10 @@ int laser_refused_for_good(int token, uint32_t lba)
  * outright, where the same blocks read in smaller commands go through. So a
  * plain I/O failure on more than LASER_MIN_BYTES_PER_TRANSFER is not final:
  * the same blocks are read again at half the size, halving again on each
- * failure. Only once the whole failed range has been read that way is the
- * smaller size kept for the device: the large command failed on blocks that
- * are readable, so the limit was the bridge's. A scratch inside the range
+ * failure. Only once the whole failed range has been read that way, and for
+ * the second time, is the smaller size kept for the device: the large
+ * command failed on blocks that are readable, so the limit was the bridge's
+ * - once, it may have been a failure that passed. A scratch inside the range
  * fails the smaller reads too, and leaves the cap alone.
  *
  * This terminates: every retry is strictly smaller than the transfer that
