@@ -9,6 +9,7 @@ XXXX-XX-XX: version 0.3.2
     - Add a block read for read-ahead, giving up at the first failure
     - Wait for the operations in flight before tearing a device down
     - Let the abort check end the wait for a drive to become ready
+    - Pad command blocks to 12 bytes on ATAPI-subclass interfaces
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/

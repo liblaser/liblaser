@@ -233,6 +233,12 @@ int laser_bot_send_locked(laser_entry_t *entry,
     cbw.bCBWCBLength = (uint8_t)cdb_len;
     memcpy(cbw.CBWCB, cdb, (size_t)cdb_len);
 
+    /* An ATAPI command packet is 12 bytes: a shorter CDB goes out padded
+     * with the zeros the memset left. See laser_entry_t::pad_cdb12. */
+    if (entry->pad_cdb12 && cdb_len < 12) {
+        cbw.bCBWCBLength = 12;
+    }
+
     ret = libusb_bulk_transfer(entry->handle, entry->ep_out,
                                (unsigned char *)&cbw, USB_BOT_CBW_SIZE,
                                &transferred, cbw_timeout);

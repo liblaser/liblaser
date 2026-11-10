@@ -223,6 +223,13 @@ typedef struct {
     unsigned char ep_in;
     unsigned char ep_out;
 
+    /* Set for an interface whose subclass is SFF-8020i (02h) or SFF-8070i
+     * (05h): its command blocks are 12 bytes whatever the command, so the
+     * 6- and 10-byte CDBs are sent padded with zeros. See
+     * laser_find_bulk_endpoints() and laser_bot_send_locked(). Written
+     * before the entry is published. */
+    int pad_cdb12;
+
     /* wMaxPacketSize of the bulk pair: 64 at full speed, 512 at high speed,
      * 1024 at SuperSpeed. Read off the descriptor, since
      * libusb_get_device_speed() reports UNKNOWN on some kernels. Used by the

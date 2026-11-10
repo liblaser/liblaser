@@ -57,10 +57,12 @@
  * Transport", the only thing implemented here. The subclass only names the
  * command set on top (0x06 SCSI transparent, 0x02 ATAPI/MMC, a few historical
  * others), all of which are SCSI-MMC to an optical drive; matching on it would
- * reject conformant drives for no gain. */
+ * reject conformant drives for no gain. It does say how long a command block
+ * is: see laser_entry_t::pad_cdb12. */
 #define USB_CLASS_MASS_STORAGE      0x08
 #define USB_MS_PROTOCOL_BULK_ONLY   0x50
 #define USB_MS_SUBCLASS_MMC         0x02
+#define USB_MS_SUBCLASS_8070I       0x05
 #define USB_MS_SUBCLASS_SCSI        0x06
 
 int laser_find_bulk_endpoints(laser_entry_t *entry)
@@ -154,7 +156,25 @@ int laser_find_bulk_endpoints(laser_entry_t *entry)
              : mps <= 512 ? "high speed (USB 2.0)"
                           : "SuperSpeed (USB 3)");
 
+        /* The subclass does not decide whether the interface is taken, but
+         * it says how commands are framed. Under "SCSI transparent" a CDB
+         * goes out at its own length. SFF-8020i and SFF-8070i are the ATAPI
+         * packet sets, whose command packet is 12 bytes whatever the
+         * command: a bridge of that kind may refuse TEST UNIT READY as a
+         * 6-byte block. Linux pads for the same two (usb-storage's
+         * usb_stor_pad12_command). */
+        entry->pad_cdb12 =
+                iface->bInterfaceSubClass == USB_MS_SUBCLASS_MMC ||
+                iface->bInterfaceSubClass == USB_MS_SUBCLASS_8070I;
+        if (entry->pad_cdb12) {
+            LOGI("usb %04x:%04x: interface %u has ATAPI subclass 0x%02x, "
+                 "padding command blocks to 12 bytes",
+                 entry->vid, entry->pid, iface->bInterfaceNumber,
+                 iface->bInterfaceSubClass);
+        }
+
         if (iface->bInterfaceSubClass != USB_MS_SUBCLASS_SCSI &&
+            iface->bInterfaceSubClass != USB_MS_SUBCLASS_8070I &&
             iface->bInterfaceSubClass != USB_MS_SUBCLASS_MMC) {
             /* Accepted, but logged: a per-device workaround may one day want
              * to correlate against an unusual subclass. */
