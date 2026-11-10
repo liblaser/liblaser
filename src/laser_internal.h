@@ -490,6 +490,14 @@ enum {
     LASER_WAIT_NOT_READY,
 };
 
+/**
+ * How the last readiness wait of the drive behind @p token ended, a
+ * LASER_WAIT_* value: laser_entry_t::wait_state, for a caller that has no
+ * business with the entry. LASER_WAIT_NOT_READY for a token that is not
+ * registered.
+ */
+int laser_wait_state(int token);
+
 /** Answers of laser_probe_lun(). */
 enum {
     /** INQUIRY says direct-access block device. Not an optical drive. */

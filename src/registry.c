@@ -216,8 +216,19 @@ static void wait_unpinned(laser_entry_t *entry)
     pthread_mutex_unlock(&g_table_lock);
 }
 
+int laser_wait_state(int token)
+{
+    laser_entry_t *entry = laser_pin(token);
+    const int state = entry != NULL ? entry->wait_state
+                                    : LASER_WAIT_NOT_READY;
+    laser_unpin(entry);
+    return state;
+}
+
 int laser_token_not_ready(int token)
 {
+    /* 0 for a token that is not registered, as laser.h says: nothing is
+     * known of a drive nobody set up. */
     laser_entry_t *entry = laser_pin(token);
     const int not_ready = entry != NULL &&
                           entry->wait_state != LASER_WAIT_READY;

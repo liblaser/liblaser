@@ -33,8 +33,10 @@
 
 #include "laser.h"
 #include "laser_disc.h"
-#include "laser_internal.h"   /* logging and laser_token_settle(); commands
-                                * go through laser.h only */
+#include "laser_internal.h"   /* logging, laser_token_settle() and
+                                * laser_wait_state(); commands go through
+                                * laser.h only, and the registry's entry is
+                                * never touched here */
 
 #include <udfread.h>
 #include <blockinput.h>
@@ -1014,11 +1016,7 @@ void laser_disc_identify_lang(int token, const char *const *langs,
     /* A drive still not ready would answer every probe below the same way,
      * each after a full retry budget. Why it is not ready - no medium, the
      * tray open, or no answer - is what its wait last found. */
-    laser_entry_t *entry = laser_pin(token);
-    const int wait_state = entry != NULL ? entry->wait_state
-                                         : LASER_WAIT_NOT_READY;
-    laser_unpin(entry);
-
+    const int wait_state = laser_wait_state(token);
     if (wait_state != LASER_WAIT_READY) {
         switch (wait_state) {
             case LASER_WAIT_NO_MEDIUM:
