@@ -25,6 +25,7 @@
 #ifndef LASER_INTERNAL_H
 #define LASER_INTERNAL_H
 
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sys/types.h>
 #include <pthread.h>
@@ -85,7 +86,15 @@ void laser_log(laser_log_level_t level, const char *fmt, ...)
 #define LASER_REFUSAL_MAX_HITS 3
 
 /** Per-device state for USB Mass Storage Bulk-Only Transport (BOT); the
- * protocol itself is in bot.c. */
+ * protocol itself is in bot.c.
+ *
+ * THE FIELDS READ WITHOUT A LOCK ARE ATOMIC - each says below why a reader
+ * may see it a moment late. That is all they say: a plain int read while
+ * another thread writes it is a data race, which the compiler may assume
+ * does not happen, whatever the value read. An atomic costs nothing more
+ * here: one aligned load or store on every ABI this builds for. Zeroing the
+ * slot with the others, in reserve_slot() and release_slot(), sets them to
+ * 0: no thread reads an entry then. */
 typedef struct {
     /* Is this slot a live, fully set-up registration? Written last by
      * laser_register(), so a slot under construction - which lasts seconds -
@@ -115,14 +124,14 @@ typedef struct {
      *
      * Written under io_lock, read without it when sizing a chunk: a stale
      * read asks for too much once and fails over to the same negotiation. */
-    int max_transfer_bytes;
+    atomic_int max_transfer_bytes;
 
     /* Set once the drive has refused a READ CD of audio sectors declared as
      * CD-DA, as malformed: such reads then declare "any type", which it
      * takes. See laser_read_cd_blocks() in read.c. Only goes from 0 to 1,
      * read and written without a lock: a stale read costs one more
      * refusal. */
-    int cdda_any_type;
+    atomic_int cdda_any_type;
 
     /* Largest read, in bytes, this device has completed in one command: a
      * failed transfer no larger than that cannot be the bridge's limit, and
@@ -131,7 +140,7 @@ typedef struct {
      *
      * Starts at 0 (the slot is zeroed) and only ever grows. Written under
      * io_lock, read without it: a stale read negotiates once for nothing. */
-    int largest_ok_bytes;
+    atomic_int largest_ok_bytes;
 
     /* Runs of blocks the disc could not be read in - a read failing with
      * LASER_ERR_IO on the disc, the drive answering with a medium error or
@@ -176,7 +185,7 @@ typedef struct {
      *
      * Written under io_lock, read without it: a reader that misses a change
      * sees it at its next look. */
-    unsigned media_generation;
+    atomic_uint media_generation;
 
     /* Operations in progress on this entry: laser_pin() and laser_unpin().
      * The teardown waits for it to fall to 0 before it frees the slot.
@@ -191,7 +200,7 @@ typedef struct {
      *
      * Read without any lock, on the transaction path: it only goes from 0 to
      * 1, so a reader that misses it sees it one attempt later. */
-    int cancelled;
+    atomic_int cancelled;
 
     /* Latched once the device is shown to have left the bus, so that every
      * later command on the token fails at once instead of spending a retry
@@ -200,7 +209,7 @@ typedef struct {
      * registration.
      *
      * Read without any lock, on the same terms as `cancelled`. */
-    int device_gone;
+    atomic_int device_gone;
 
     /* Identity of the descriptor at registration, from fstat(), so that
      * laser_acquire() can refuse an fd number the system has recycled while
@@ -322,12 +331,12 @@ typedef struct {
      * Registration succeeds either way; laser_disc_identify() reads it to
      * skip probes that would each spend a retry budget for nothing. Written
      * under io_lock, read without it. */
-    int             wait_state;
+    atomic_int      wait_state;
 
     /* Set once the drive has failed to answer GET EVENT STATUS NOTIFICATION
      * for the media class: laser_media_poll() then asks TEST UNIT READY. Not
      * locked: a poll that reads it stale asks the 4Ah once more. */
-    int             media_events_unsupported;
+    atomic_int      media_events_unsupported;
 
     /* When a command last failed an attempt, on CLOCK_MONOTONIC in
      * milliseconds; 0 if none has. A media poll leaves the drive alone for
