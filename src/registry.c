@@ -333,7 +333,8 @@ static void reattach_kernel_driver(laser_entry_t *entry)
  *
  * @return the entry, published; NULL if the device could not be set up, and
  *         then why in @p why: LASER_ERR_NOT_OPTICAL for a device that is no
- *         optical drive, LASER_ERR_NO_SUCH_TOKEN for anything else.
+ *         optical drive, LASER_ERR_CANCELLED when the calling thread's abort
+ *         check stopped the setup, LASER_ERR_NO_SUCH_TOKEN for anything else.
  *
  * Caller MUST hold g_registry_lock. */
 static laser_entry_t *laser_register(int fd, laser_status_t *why)
@@ -515,13 +516,33 @@ static laser_entry_t *laser_register(int fd, laser_status_t *why)
         goto err_iface;
     }
 
+    /* The caller stopped during the probe: declined, nothing being known
+     * of the device - which gets its kernel driver back, as it may be no
+     * drive at all. */
+    if (optical == LASER_OPTICAL_CANCELLED) {
+        LOGI("register(fd=%d, usb %04x:%04x): given up during the probe, "
+             "the caller is stopping", fd, entry->vid, entry->pid);
+        *why = LASER_ERR_CANCELLED;
+        goto err_iface;
+    }
+
     /* The detached kernel driver may have left the tray locked. */
     if (entry->kernel_driver_detached)
         laser_allow_medium_removal(entry);
 
     /* Some firmware fails a READ that arrives before spin-up instead of
      * starting it, so wait before anything reads. */
-    laser_wait_until_ready(entry);
+    if (laser_wait_until_ready(entry)) {
+        /* The caller stopped: not registered, rather than registered as a
+         * drive that never became ready, which the next classification
+         * would report without waiting. The drive is one we keep: its
+         * kernel driver stays detached, as after a teardown. */
+        LOGI("register(fd=%d, usb %04x:%04x): given up during the readiness "
+             "wait, the caller is stopping", fd, entry->vid, entry->pid);
+        entry->kernel_driver_detached = 0;
+        *why = LASER_ERR_CANCELLED;
+        goto err_iface;
+    }
 
     /* Publish, last and under the table lock, so that whoever sees
      * in_use == 1 also sees every field written above. */
@@ -536,7 +557,8 @@ static laser_entry_t *laser_register(int fd, laser_status_t *why)
     return entry;
 
     /* Unwind ladder, in reverse order of acquisition. err_iface serves the
-     * only failures after the claim: the declines above. */
+     * only failures after the claim: the declines above, and a caller that
+     * stopped. */
     err_iface:
     libusb_release_interface(entry->handle, entry->iface_num);
     err_handle:
@@ -801,6 +823,8 @@ laser_status_t laser_acquire(int token)
         pthread_mutex_unlock(&g_registry_lock);
         if (why == LASER_ERR_NOT_OPTICAL)
             LOGI("acquire(token=%d): not an optical drive", token);
+        else if (why == LASER_ERR_CANCELLED)
+            LOGI("acquire(token=%d): given up, the caller is stopping", token);
         else
             LOGW("acquire(token=%d): could not register the device", token);
         return why;

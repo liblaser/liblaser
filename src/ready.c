@@ -24,7 +24,9 @@
  * on a registered one: the INQUIRY probe that finds its optical unit, the
  * tray unlock, and the wait for its medium to become ready - spin-up,
  * UNIT ATTENTIONs and a disc still loading included. Bounded in real time:
- * at registration it runs under the registry lock.
+ * at registration it runs under the registry lock. And given up when the
+ * caller's abort check says so: a consumer that stops must not be held for
+ * the thirty seconds of a drive loading a disc.
  *
  * Commands go through laser_command_locked() (scsi.c), or straight to
  * laser_bot_send_locked() for the INQUIRY probe, without the retries of
@@ -89,6 +91,10 @@
  * the first attempt and sleeps for none of it. */
 #define LASER_INQUIRY_MAX_ATTEMPTS 7
 #define LASER_INQUIRY_RETRY_MS     100
+
+/* inquiry_pdt() given up by the caller's abort check: apart from
+ * laser_bot_send_locked()'s codes, which it otherwise returns. */
+#define INQUIRY_STOPPED (-10)
 
 /* One START STOP UNIT in the exact shape asked for. Returns the CSW status,
  * and fills the sense triple when that status is FAIL - the sense being what
@@ -286,14 +292,21 @@ static void log_media_status_locked(laser_entry_t *entry)
  * raised to LASER_BECOMING_READY_MAX_WALL_MS once the drive has said it is
  * becoming ready.
  *
- * Not cancellable. At registration it runs inside laser_acquire(), under
- * g_registry_lock, on an entry not yet published; laser_token_settle() may
- * run it again on a published one. */
-void laser_wait_until_ready(laser_entry_t *entry)
+ * At registration it runs inside laser_acquire(), under g_registry_lock, on
+ * an entry not yet published; laser_token_settle() may run it again on a
+ * published one. Given up when laser_must_stop() says so, asked before
+ * anything is sent and on every round - see laser_internal.h for what is
+ * left behind. */
+int laser_wait_until_ready(laser_entry_t *entry)
 {
     const int64_t started = laser_monotonic_ms_now();
 
     pthread_mutex_lock(&entry->io_lock);
+
+    if (laser_must_stop(entry)) {
+        pthread_mutex_unlock(&entry->io_lock);
+        return 1;
+    }
 
     /* Asked before the first poll rather than on a first 3Ah answer: a drive
      * answering "becoming ready" as a generic busy state would otherwise
@@ -325,6 +338,17 @@ void laser_wait_until_ready(laser_entry_t *entry)
      * and meets a ceiling check, or is a UNIT ATTENTION retry, itself
      * bounded. */
     for (int attempt = 1; ; attempt++) {
+        /* After each sleep, and before the first poll: the START STOP UNIT
+         * above may have taken a while. */
+        if (laser_must_stop(entry)) {
+            LOGI("token=%d: readiness wait given up after %lldms (attempt "
+                 "%d): stopping", entry->token,
+                 (long long)(laser_monotonic_ms_now() - started), attempt);
+            entry->wait_state = LASER_WAIT_READY;   /* not known */
+            pthread_mutex_unlock(&entry->io_lock);
+            return 1;
+        }
+
         uint8_t sense_key, asc, ascq;
         int rc = laser_test_unit_ready_locked(entry, &sense_key, &asc, &ascq);
         const int64_t now = laser_monotonic_ms_now();
@@ -334,7 +358,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
                  entry->token, attempt, (long long)(now - started));
             entry->wait_state = LASER_WAIT_READY;
             pthread_mutex_unlock(&entry->io_lock);
-            return;
+            return 0;
         }
 
         if (rc == BOT_FAIL_NO_DEVICE) {
@@ -353,7 +377,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
 
             entry->wait_state = LASER_WAIT_NOT_READY;
             pthread_mutex_unlock(&entry->io_lock);
-            return;
+            return 0;
         }
 
         /* Logged raw: 02h/3Ah, 02h/04h/01h and 06h/28h/00h call for different
@@ -388,7 +412,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
             log_media_status_locked(entry);
             entry->wait_state = LASER_WAIT_TRAY_OPEN;
             pthread_mutex_unlock(&entry->io_lock);
-            return;
+            return 0;
         }
 
         if (medium == MEDIUM_SENSE_ABSENT) {
@@ -406,7 +430,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
                 log_media_status_locked(entry);
                 entry->wait_state = LASER_WAIT_NO_MEDIUM;
                 pthread_mutex_unlock(&entry->io_lock);
-                return;
+                return 0;
             }
 
             if (loading && no_medium_ms >= LASER_NO_MEDIUM_MAX_WALL_MS)
@@ -459,6 +483,7 @@ void laser_wait_until_ready(laser_entry_t *entry)
          (long long)(laser_monotonic_ms_now() - started));
     entry->wait_state = LASER_WAIT_NOT_READY;
     pthread_mutex_unlock(&entry->io_lock);
+    return 0;
 }
 
 /* See laser_internal.h. The sense of a failed TEST UNIT READY is read: a
@@ -521,7 +546,7 @@ static void settle_entry(laser_entry_t *entry, int token)
 
     LOGI("token=%d: registered drive not ready - disc changed or still "
          "loading, waiting for it", token);
-    laser_wait_until_ready(entry);
+    (void) laser_wait_until_ready(entry);
 }
 
 void laser_token_settle(int token)
@@ -541,7 +566,8 @@ void laser_token_settle(int token)
  *
  * @param pdt receives the peripheral device type on success.
  * @return 0 on success, BOT_FAIL_NO_DEVICE if the device is gone, -1 if the
- *         unit did not answer.
+ *         unit did not answer, INQUIRY_STOPPED if the caller's abort check
+ *         said to stop between two attempts.
  */
 static int inquiry_pdt(laser_entry_t *entry, int attempts, uint8_t *pdt)
 {
@@ -574,6 +600,14 @@ static int inquiry_pdt(laser_entry_t *entry, int attempts, uint8_t *pdt)
                  "attempt %d/%d, giving up)",
                  entry->token, entry->lun, rc, actual, attempt, attempts);
             break;
+        }
+
+        /* Six seconds of settling, all told, are not for a caller that
+         * stops. */
+        if (laser_must_stop(entry)) {
+            LOGI("token=%d: INQUIRY retries given up: stopping",
+                 entry->token);
+            return INQUIRY_STOPPED;
         }
 
         /* Doubling from LASER_INQUIRY_RETRY_MS: the wait is what the retry
@@ -632,6 +666,10 @@ int laser_probe_lun(laser_entry_t *entry)
             LOGW("token=%d: device left the bus during the LUN probe",
                  entry->token);
             return LASER_OPTICAL_GONE;
+        }
+        if (rc == INQUIRY_STOPPED) {
+            entry->lun = 0;
+            return LASER_OPTICAL_CANCELLED;
         }
         if (rc != 0)
             continue; /* Unit absent or unhappy; try the next one. */

@@ -353,9 +353,10 @@ void laser_unpin(laser_entry_t *entry);
  *
  * Set only by the laser_release() that drops the last claim, just before
  * it waits for the operations in flight and tears down. Tested without a
- * lock, by the retry loop and the chunk loops
- * (see laser_entry_t::cancelled) - not by the spin-up wait, which runs on an
- * entry not yet published, that nothing can cancel.
+ * lock, by the retry loop, the chunk loops and the readiness wait
+ * (see laser_entry_t::cancelled) - though not at registration, where that
+ * wait runs on an entry not yet published, that only its own thread's abort
+ * check can stop.
  */
 void laser_set_cancelled(laser_entry_t *entry);
 int  laser_is_cancelled(const laser_entry_t *entry);
@@ -426,10 +427,19 @@ void laser_allow_medium_removal(laser_entry_t *entry);
  *
  * Bounded in real time by LASER_SPINUP_MAX_WALL_MS (15 s), raised to
  * LASER_BECOMING_READY_MAX_WALL_MS (30 s) for a drive that says it is becoming
- * ready; it cannot be cancelled. A working drive returns within a few seconds,
- * or within the time it takes to load a disc just inserted. See ready.c.
+ * ready. A working drive returns within a few seconds, or within the time it
+ * takes to load a disc just inserted. See ready.c.
+ *
+ * Given up, on any of its rounds, when the token is cancelled or the calling
+ * thread's abort check says to stop: nothing is then known of the drive, and
+ * laser_entry_t::wait_state is left saying so - LASER_WAIT_READY, the value
+ * before any wait - for the next laser_token_settle() to wait again rather
+ * than take the drive for one that never became ready.
+ *
+ * @return 0 when the wait ran to its end, whatever it found; non-zero when
+ *         it was given up.
  */
-void laser_wait_until_ready(laser_entry_t *entry);
+int laser_wait_until_ready(laser_entry_t *entry);
 
 /**
  * On a token already registered, one TEST UNIT READY, then
@@ -471,6 +481,9 @@ enum {
     LASER_OPTICAL_NO_ANSWER = -1,
     /** The device left the bus during the probe. */
     LASER_OPTICAL_GONE = -2,
+    /** The calling thread's abort check said to stop, between two INQUIRY
+     * attempts: nothing is known of the device. */
+    LASER_OPTICAL_CANCELLED = -3,
 };
 
 /**
@@ -492,8 +505,8 @@ enum {
  * all. The caller declines both that and LASER_OPTICAL_GONE, handing the
  * device back to the kernel - the only agent able to reset it.
  *
- * @return LASER_OPTICAL_YES, LASER_OPTICAL_NO, LASER_OPTICAL_NO_ANSWER or
- *         LASER_OPTICAL_GONE.
+ * @return LASER_OPTICAL_YES, LASER_OPTICAL_NO, LASER_OPTICAL_NO_ANSWER,
+ *         LASER_OPTICAL_GONE or LASER_OPTICAL_CANCELLED.
  */
 int laser_probe_lun(laser_entry_t *entry);
 

@@ -180,9 +180,8 @@ void laser_set_abort_cb(laser_abort_cb_t cb, void *opaque)
     abort_opaque = opaque;
 }
 
-/* Whether the operation in progress on this thread must give up: the token
- * was cancelled, or this thread's consumer asked to stop. */
-static int laser_must_stop(const laser_entry_t *entry)
+/* See scsi_internal.h. */
+int laser_must_stop(const laser_entry_t *entry)
 {
     return laser_is_cancelled(entry) ||
            (abort_cb != NULL && abort_cb(abort_opaque));

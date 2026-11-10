@@ -226,6 +226,13 @@ int laser_command_locked(laser_entry_t *entry, const uint8_t *cdb,
 int laser_test_unit_ready_locked(laser_entry_t *entry, uint8_t *sense_key,
                                  uint8_t *asc, uint8_t *ascq);
 
+/* Whether the operation in progress on this thread must give up: the token
+ * was cancelled (laser_release()), or this thread's consumer asked to stop
+ * (laser_set_abort_cb()). Asked at every checkpoint: before a command queues
+ * for the drive, between its attempts, between the chunks of a block read,
+ * and on every round of a readiness wait. */
+int laser_must_stop(const laser_entry_t *entry);
+
 /* Sleeps @p ms with io_lock released, then takes it again: for the delays
  * between the attempts of a command, and the rounds of a wait, so that the
  * other consumers of the drive - a poll, the player, libdvdcss - are not held

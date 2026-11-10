@@ -125,7 +125,8 @@ typedef struct {
  *
  * A drive that is not ready - a disc swapped since the token was registered,
  * still loading - is first waited for, as laser_acquire() does, for up to
- * 30 s and without cancellation. A ready drive costs one TEST UNIT READY.
+ * 30 s, or until the calling thread's abort check says to stop
+ * (laser_set_abort_cb()). A ready drive costs one TEST UNIT READY.
  *
  * BEST EFFORT, AND NEVER FATAL. @p out is always filled: an unreadable or
  * unrecognised disc yields LASER_DISC_UNKNOWN and an empty volume_id and

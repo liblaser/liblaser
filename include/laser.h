@@ -239,6 +239,12 @@ int laser_parse_token(const char *str, int *token);
  * Registrations are serialized, so a second device's first claim waits
  * behind it. Do not call this from a thread that must stay responsive.
  *
+ * THE SETUP CAN BE GIVEN UP: with an abort check set on the calling thread
+ * (laser_set_abort_cb()), it stops between two attempts to reach the drive
+ * and on any round of the wait for it to spin up, within half a second or
+ * one command. Nothing is then registered and no claim is held - rather
+ * than a device registered as one that never became ready.
+ *
  * A RECYCLED DESCRIPTOR IS REFUSED. If @p token is already registered but no
  * longer names the device it was registered on, a claim was never released
  * and the system has reused the fd number. This is refused and logged as an
@@ -246,9 +252,11 @@ int laser_parse_token(const char *str, int *token);
  * go.
  *
  * @return LASER_OK - and only then must laser_release() be called -
- *         LASER_ERR_NOT_OPTICAL if the device is no optical drive, or
- *         LASER_ERR_NO_SUCH_TOKEN if it could not be set up, or if the
- *         descriptor no longer names the device registered under it.
+ *         LASER_ERR_NOT_OPTICAL if the device is no optical drive,
+ *         LASER_ERR_CANCELLED if the calling thread's abort check stopped
+ *         the setup, or LASER_ERR_NO_SUCH_TOKEN if the device could not be
+ *         set up, or if the descriptor no longer names the device registered
+ *         under it.
  */
 laser_status_t laser_acquire(int token);
 
@@ -298,6 +306,12 @@ typedef int (*laser_abort_cb_t)(void *opaque);
  * retry attempts, on every round of the wait for a drive becoming ready,
  * between the chunks of a block read - and gives up with LASER_ERR_CANCELLED
  * when it returns non-zero. Passing NULL removes it.
+ *
+ * So do the two waits for a drive to spin up and load its medium, thirty
+ * seconds at most each: the one of laser_acquire() setting a device up,
+ * which then registers nothing, and the one of laser_disc_identify() on a
+ * drive found not ready, which then answers LASER_DISC_UNKNOWN. Set the
+ * check BEFORE laser_acquire() for it to cover the first.
  *
  * Unlike the cancellation laser_release() causes, it concerns no one else: the
  * token, and the operations other consumers run on it, carry on.
