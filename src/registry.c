@@ -371,15 +371,19 @@ static laser_entry_t *laser_register(int fd, laser_status_t *why)
     /* Full size until the device proves otherwise; the memset left 0. */
     entry->max_transfer_bytes = LASER_MAX_BYTES_PER_TRANSFER;
 
-    /* io_lock serializes transactions; css_mtx and css_cv guard the CSS
-     * session. */
+    /* io_lock serializes transactions; learnt_lock guards what the reads
+     * learnt of the device; css_mtx and css_cv guard the CSS session. */
     if (pthread_mutex_init(&entry->io_lock, NULL) != 0) {
         LOGE("register(fd=%d): pthread_mutex_init(io_lock) failed", fd);
         goto err_slot;
     }
+    if (pthread_mutex_init(&entry->learnt_lock, NULL) != 0) {
+        LOGE("register(fd=%d): pthread_mutex_init(learnt_lock) failed", fd);
+        goto err_io_mutex;
+    }
     if (pthread_mutex_init(&entry->css_mtx, NULL) != 0) {
         LOGE("register(fd=%d): pthread_mutex_init(css_mtx) failed", fd);
-        goto err_io_mutex;
+        goto err_learnt_mutex;
     }
     /* On LASER_CSS_CLOCK. Without pthread_condattr_setclock(), the default
      * clock is already CLOCK_REALTIME. */
@@ -583,6 +587,8 @@ static laser_entry_t *laser_register(int fd, laser_status_t *why)
     pthread_cond_destroy(&entry->css_cv);
     err_css_mutex:
     pthread_mutex_destroy(&entry->css_mtx);
+    err_learnt_mutex:
+    pthread_mutex_destroy(&entry->learnt_lock);
     err_io_mutex:
     pthread_mutex_destroy(&entry->io_lock);
     err_slot:
@@ -599,13 +605,15 @@ static pthread_mutex_t g_registry_lock = PTHREAD_MUTEX_INITIALIZER;
 /* ---------------------------------------------------------------------------
  * CSS authentication sessions - contract in laser.h.
  *
- * LOCK ORDER. Every nesting has g_registry_lock outside:
+ * LOCK ORDER. Every nesting has g_registry_lock outside, but one:
  *
  *     g_registry_lock  >  io_lock        (setup, and teardown)
  *     g_registry_lock  >  css_mtx        (teardown: wake a begin() waiting,
  *                                         is a session open?)
  *     g_registry_lock  >  g_table_lock   (publish an entry, release a slot,
  *                                         wait for its pins)
+ *
+ *     io_lock          >  learnt_lock    (a disc change, met by a command)
  *
  * No other pair nests, in either direction. laser_scsi_cdb() releases css_mtx
  * after its session check, before taking io_lock. An open session is a flag,
@@ -782,6 +790,7 @@ static void teardown_entry_locked(laser_entry_t *entry)
     }
     pthread_cond_destroy(&entry->css_cv);
     pthread_mutex_destroy(&entry->css_mtx);
+    pthread_mutex_destroy(&entry->learnt_lock);
     pthread_mutex_destroy(&entry->io_lock);
 
     release_slot(entry);

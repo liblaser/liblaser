@@ -122,7 +122,7 @@ typedef struct {
      * here rather than in a consumer, so that every consumer of the token
      * benefits.
      *
-     * Written under io_lock, read without it when sizing a chunk: a stale
+     * Written under learnt_lock, read without it when sizing a chunk: a stale
      * read asks for too much once and fails over to the same negotiation. */
     atomic_int max_transfer_bytes;
 
@@ -139,7 +139,8 @@ typedef struct {
      * on the same sector, at the cost of a second round of timeouts.
      *
      * Starts at 0 (the slot is zeroed) and only ever grows. Written under
-     * io_lock, read without it: a stale read negotiates once for nothing. */
+     * learnt_lock, read without it: a stale read negotiates once for
+     * nothing. */
     atomic_int largest_ok_bytes;
 
     /* Runs of blocks the disc could not be read in - a read failing with
@@ -154,7 +155,7 @@ typedef struct {
      * identification, libdvdcss and each playback alike, until the disc
      * changes. See read_chunked() in read.c.
      *
-     * Written and read under io_lock. */
+     * Written and read under learnt_lock. */
     struct {
         uint32_t lba;
         uint32_t count;
@@ -170,7 +171,7 @@ typedef struct {
      * session is in force: once authenticated again, the scrambled blocks
      * read. See read_chunked().
      *
-     * Written and read under io_lock. */
+     * Written and read under learnt_lock. */
     struct {
         uint32_t lba;
         int      status;
@@ -297,6 +298,18 @@ typedef struct {
     /* There is deliberately no "last CSW status" field: the status is passed
      * back through laser_bot_send_locked()'s out-parameter, since the
      * REQUEST SENSE that follows a failure would overwrite a shared copy. */
+
+    /* Guards what the reads learnt of the device and of its disc: the two
+     * tables above, and the writes to max_transfer_bytes and
+     * largest_ok_bytes. A lock of its own, held for a table's length and
+     * never across a command: under io_lock, which a command holds through
+     * its retries, a reader asking whether a block is known not to read
+     * waited for another consumer's read to end - seconds, on the very
+     * blocks the tables are there to keep away from.
+     *
+     * Taken alone, or under io_lock (laser_disc_changed_locked()); nothing
+     * is taken under it. */
+    pthread_mutex_t learnt_lock;
 
     /* Serializes BOT transactions on this device - one CBW, its data phase,
      * its CSW, never interleaved - for the whole of laser_scsi_cdb(),

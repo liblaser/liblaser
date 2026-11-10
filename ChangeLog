@@ -16,6 +16,7 @@ XXXX-XX-XX: version 0.3.2
     - Report a media poll skipped on a busy drive as such, not as a failure
     - Make the fields read without a lock atomic
     - Simplifications
+    - Answer what is known of a block without waiting for the drive
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/

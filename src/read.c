@@ -58,11 +58,11 @@ static void raise_largest_ok(laser_entry_t *entry, int bytes)
         return;
     }
 
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
     if (bytes > entry->largest_ok_bytes) {
         entry->largest_ok_bytes = bytes;
     }
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 }
 
 /* Lower this device's transfer cap to @p bytes, if it is above that. Called
@@ -71,14 +71,14 @@ static void raise_largest_ok(laser_entry_t *entry, int bytes)
 static void lower_transfer_cap(laser_entry_t *entry, int bytes,
                                int failed_bytes)
 {
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
 
     const int lowered = bytes < entry->max_transfer_bytes;
     if (lowered) {
         entry->max_transfer_bytes = bytes;
     }
 
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 
     if (lowered) {
         LOG_QUIRK(entry, "a %d-byte transfer failed where %d-byte ones read "
@@ -102,7 +102,7 @@ static int known_bad_block(laser_entry_t *entry, uint32_t lba, int *chunk,
 {
     int status = 0;
 
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
     for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS && status == 0; i++) {
         const uint32_t bad = entry->unreadable[i].lba;
         const uint32_t count = entry->unreadable[i].count;
@@ -131,7 +131,7 @@ static int known_bad_block(laser_entry_t *entry, uint32_t lba, int *chunk,
             *chunk = (int)(bad - lba);
         }
     }
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 
     return status;
 }
@@ -148,7 +148,7 @@ static void remember_unreadable(laser_entry_t *entry, int token, uint32_t lba,
     const uint64_t end = start + (uint64_t)count;
     int merged = 0;
 
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
     for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS; i++) {
         const uint64_t run_start = entry->unreadable[i].lba;
         const uint64_t run_end = run_start + entry->unreadable[i].count;
@@ -169,7 +169,7 @@ static void remember_unreadable(laser_entry_t *entry, int token, uint32_t lba,
         entry->unreadable_next = (entry->unreadable_next + 1) %
                                  LASER_UNREADABLE_SLOTS;
     }
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 
     LOGW("token=%d: LBA %u x %d unreadable, not asked for again until the "
          "disc changes", token, lba, count);
@@ -180,14 +180,14 @@ static void remember_unreadable(laser_entry_t *entry, int token, uint32_t lba,
 static void remember_refusal(laser_entry_t *entry, int token, uint32_t lba,
                              int status)
 {
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
     for (unsigned i = 0; i < LASER_REFUSAL_SLOTS; i++) {
         if (entry->refused[i].hits > 0 && entry->refused[i].lba == lba) {
             /* Saturating: a wrap would unlatch. */
             if (entry->refused[i].hits < LASER_REFUSAL_MAX_HITS) {
                 entry->refused[i].hits++;
             }
-            pthread_mutex_unlock(&entry->io_lock);
+            pthread_mutex_unlock(&entry->learnt_lock);
             return;
         }
     }
@@ -205,7 +205,7 @@ static void remember_refusal(laser_entry_t *entry, int token, uint32_t lba,
     entry->refused[slot].lba = lba;
     entry->refused[slot].status = status;
     entry->refused[slot].hits = 1;
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 
     switch (status) {
     case LASER_ERR_REGION:
@@ -230,12 +230,12 @@ static void forget_refusals(laser_entry_t *entry, int token, const char *why)
 {
     int count = 0;
 
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
     for (unsigned i = 0; i < LASER_REFUSAL_SLOTS; i++) {
         count += entry->refused[i].hits > 0;
     }
     memset(entry->refused, 0, sizeof(entry->refused));
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 
     if (count > 0) {
         LOGI("token=%d: %s - forgetting %d refused block(s)", token, why,
@@ -248,6 +248,7 @@ void laser_disc_changed_locked(laser_entry_t *entry)
 {
     int count = 0;
 
+    pthread_mutex_lock(&entry->learnt_lock);
     for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS; i++) {
         count += entry->unreadable[i].count > 0;
     }
@@ -258,6 +259,7 @@ void laser_disc_changed_locked(laser_entry_t *entry)
     memset(entry->unreadable, 0, sizeof(entry->unreadable));
     entry->unreadable_next = 0;
     memset(entry->refused, 0, sizeof(entry->refused));
+    pthread_mutex_unlock(&entry->learnt_lock);
     entry->media_generation++;
 
     if (count > 0) {
@@ -288,7 +290,7 @@ int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks)
     }
 
     int count = 0;
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
     for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS; i++) {
         const uint32_t bad = entry->unreadable[i].lba;
         const uint32_t run = entry->unreadable[i].count;
@@ -298,7 +300,7 @@ int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks)
             break;
         }
     }
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 
     laser_unpin(entry);
     return count;
@@ -312,7 +314,7 @@ int laser_refused_for_good(int token, uint32_t lba)
     }
 
     int latched = 0;
-    pthread_mutex_lock(&entry->io_lock);
+    pthread_mutex_lock(&entry->learnt_lock);
     for (unsigned i = 0; i < LASER_REFUSAL_SLOTS; i++) {
         if (entry->refused[i].hits >= LASER_REFUSAL_MAX_HITS &&
             entry->refused[i].lba == lba) {
@@ -320,7 +322,7 @@ int laser_refused_for_good(int token, uint32_t lba)
             break;
         }
     }
-    pthread_mutex_unlock(&entry->io_lock);
+    pthread_mutex_unlock(&entry->learnt_lock);
 
     laser_unpin(entry);
     return latched;
