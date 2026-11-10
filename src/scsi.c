@@ -54,7 +54,10 @@
  * in a Reset Recovery, some five seconds - is not retried further: a drive
  * stuck on a sector, as some are on a scrambled one read without CSS
  * authentication, does no better the next four times, and the full budget
- * turned one sector into half a minute. */
+ * turned one sector into half a minute.
+ *
+ * Most often the second attempt is not made either: the drive is asked
+ * whether it is ready after the first, see unit_ready_after_reset_locked(). */
 #define LASER_READ_MAX_RESETS   2
 
 /* For a read - READ(10), READ CD - its first block and block count:
@@ -193,6 +196,41 @@ int64_t laser_monotonic_ms_now(void)
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+/* After a read the drive did not answer, ending in a Reset Recovery: is it
+ * the drive, or those sectors? One TEST UNIT READY, under the probe timeouts
+ * - a drive able to answer does so at once.
+ *
+ *   ready            the sectors: the drive answers, and did not answer the
+ *                    read. Reading them again would cost the same timeout.
+ *   not ready, or    the drive: spinning up after a pause, its medium gone
+ *   medium changed   or changed. Nothing is said of the sectors.
+ *   no answer        not known: the caller reads once more, as it always
+ *                    did.
+ *
+ * A UNIT ATTENTION other than a changed medium - some bridges raise one
+ * after a reset - is cleared by being reported, and says nothing: asked once
+ * more.
+ *
+ * Returns laser_bot_send_locked()'s code, 0 for ready, and the sense as
+ * laser_command_locked().
+ *
+ * Caller MUST already hold entry->io_lock. */
+static int unit_ready_after_reset_locked(laser_entry_t *entry,
+                                         uint8_t *sense_key, uint8_t *asc,
+                                         uint8_t *ascq)
+{
+    entry->probe_timeouts = 1;
+    int rc = laser_test_unit_ready_locked(entry, sense_key, asc, ascq);
+    if (rc != 0 && rc != BOT_FAIL_NO_DEVICE &&
+        *sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
+        !(*asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+          *ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED)) {
+        rc = laser_test_unit_ready_locked(entry, sense_key, asc, ascq);
+    }
+    entry->probe_timeouts = 0;
+    return rc;
+}
+
 /* Only transfers at least this large are sampled: smaller ones measure
  * command latency, not the link. And only reads continuing the previous one:
  * see the caller. */
@@ -310,6 +348,7 @@ laser_status_t laser_scsi_cdb_read(int token,
 {
     if (why != NULL) {
         why->medium_error = 0;
+        why->no_answer = 0;
         why->sense_key = 0xff;
         why->asc = 0;
         why->ascq = 0;
@@ -484,13 +523,60 @@ laser_status_t laser_scsi_cdb_read(int token,
              * for REQUEST SENSE to explain. The attempt still counts. */
             LOGW("token=%d: cdb 0x%02x%s ended in a Reset Recovery (attempt "
                  "%d/%d)", token, cdb[0], where, attempt, LASER_MAX_RETRIES);
-            if (is_read && ++resets_in_a_row >= LASER_READ_MAX_RESETS) {
-                LOGW("token=%d: cdb 0x%02x%s - the drive did not answer %d "
-                     "times in a row, giving up on this read",
-                     token, cdb[0], where, resets_in_a_row);
-                reason_logged = 1;
-                result = LASER_ERR_IO;
-                break;
+            if (is_read) {
+                resets_in_a_row++;
+
+                /* The drive, or these sectors? */
+                int ready = unit_ready_after_reset_locked(entry, &sense_key,
+                                                          &asc, &ascq);
+                if (ready == BOT_FAIL_NO_DEVICE) {
+                    LOGW("token=%d: device no longer present, not retrying",
+                         token);
+                    entry->device_gone = 1;
+                    result = LASER_ERR_NO_DEVICE;
+                    break;
+                }
+                if (sense_key != 0xff) {
+                    last_sense_key = sense_key;
+                    last_asc = asc;
+                    last_ascq = ascq;
+                }
+
+                const medium_sense_t state =
+                    laser_medium_sense(sense_key, asc, ascq);
+                if (ready == 0) {
+                    LOGW("token=%d: cdb 0x%02x%s - the drive did not answer "
+                         "the read and answers that it is ready: these "
+                         "sectors, giving up on this read",
+                         token, cdb[0], where);
+                    reason_logged = 1;
+                    result = LASER_ERR_IO;
+                    if (why != NULL) {
+                        why->no_answer = 1;
+                    }
+                    break;
+                }
+                if (state == MEDIUM_SENSE_LOADING) {
+                    /* Spinning up: waited for below, and the read is not
+                     * held against the sectors. */
+                    resets_in_a_row = 0;
+                } else if (state == MEDIUM_SENSE_OTHER &&
+                           !(asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
+                             ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) &&
+                           resets_in_a_row >= LASER_READ_MAX_RESETS) {
+                    LOGW("token=%d: cdb 0x%02x%s - the drive did not answer "
+                         "%d times in a row (sense %02x/%02x/%02x), giving "
+                         "up on this read", token, cdb[0], where,
+                         resets_in_a_row, sense_key, asc, ascq);
+                    reason_logged = 1;
+                    result = LASER_ERR_IO;
+                    /* Stuck on the sectors if it answered nothing since;
+                     * a drive saying why it is not ready is not. */
+                    if (why != NULL && sense_key == 0xff) {
+                        why->no_answer = 1;
+                    }
+                    break;
+                }
             }
         } else if (csw_status == USB_BOT_STATUS_FAIL) {
             request_sense_locked(entry, &sense_key, &asc, &ascq);

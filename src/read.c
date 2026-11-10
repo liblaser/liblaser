@@ -329,9 +329,12 @@ int laser_refused_for_good(int token, uint32_t lba)
  * failed, and none goes below LASER_MIN_BYTES_PER_TRANSFER.
  *
  * BLOCKS KNOWN NOT TO READ are not asked for again. A chunk failing with
- * LASER_ERR_IO, its retries spent, is recorded unreadable for the device
- * (laser_entry_t::unreadable): a read starting in it fails at once, and one
- * reaching it stops short of it, as a short read. With @p refusals - READ(10)
+ * LASER_ERR_IO on the disc - the drive answering with a medium error, or
+ * not answering the read at all while it answers that it is ready - is
+ * recorded unreadable for the device (laser_entry_t::unreadable): a read
+ * starting in it fails at once, and one reaching it stops short of it, as a
+ * short read. A LASER_ERR_IO that is the drive's or the transport's is
+ * returned and nothing recorded: the next read asks the drive again. With @p refusals - READ(10)
  * - a chunk refused with a positional status is read again at half the size
  * down to the block refused, so that the blocks before it are returned, and
  * that block is recorded (laser_entry_t::refused); a read reaching it stops
@@ -519,7 +522,13 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
                 continue;
             }
 
-            if (st == LASER_ERR_IO && entry != NULL) {
+            /* Recorded only when the disc is to blame: the drive stuck on
+             * these blocks, not answering the read. Any other LASER_ERR_IO
+             * - a drive not ready within its budget, a transport failing -
+             * says nothing of the blocks, and recording them would have
+             * every consumer take them for unreadable until the disc
+             * changes. A medium error was recorded above. */
+            if (st == LASER_ERR_IO && why.no_answer && entry != NULL) {
                 remember_unreadable(entry, token, lba + (uint32_t)blocks_done,
                                     chunk);
             }

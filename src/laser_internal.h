@@ -134,8 +134,10 @@ typedef struct {
     int largest_ok_bytes;
 
     /* Runs of blocks the disc could not be read in - a read failing with
-     * LASER_ERR_IO, its retries spent: their first block and count, 0 blocks
-     * for an empty slot, and the slot the next run takes. Each attempt costs
+     * LASER_ERR_IO on the disc, the drive answering with a medium error or
+     * stuck on them, not for a failure of the drive's or the transport's:
+     * their first block and count, 0 blocks for an empty slot, and the slot
+     * the next run takes. Each attempt costs
      * a drive stuck on them seconds, over ten behind a stalling bridge, and
      * some protections put such blocks on purpose where no title plays. So a
      * read starting in a run fails at once, and one reaching a run stops

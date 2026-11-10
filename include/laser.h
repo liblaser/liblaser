@@ -108,8 +108,13 @@ typedef enum {
     LASER_ERR_NO_SUCH_TOKEN = -1,
     /**
      * Transport failure (USB I/O error, a stall that could not be cleared),
-     * or a transient SCSI condition retried until the attempt budget ran
-     * out. The drive is misbehaving: not worth retrying at a higher level.
+     * a transient SCSI condition retried until the attempt budget ran out,
+     * or blocks the disc could not be read in.
+     *
+     * For a block read, laser_unreadable_blocks() tells the last from the
+     * others: blocks it reports are the disc's, and fail at once from then
+     * on; when it reports none, the drive or the transport failed, nothing
+     * is held against the blocks, and the same read may succeed later.
      */
     LASER_ERR_IO = -2,
     /**
@@ -501,10 +506,13 @@ void laser_css_session_end(int token, const void *owner);
  *
  * BLOCKS KNOWN NOT TO READ ARE NOT ASKED FOR AGAIN, by any consumer of the
  * token, until the disc changes:
- *   - a range the disc could not be read in, LASER_ERR_IO with its retries
- *     spent: a read starting in it fails with LASER_ERR_IO at once, and one
- *     reaching it is a short read stopping before it.
- *     laser_unreadable_blocks() says how far the range goes;
+ *   - a range the disc could not be read in - the drive answered with a
+ *     medium error, or did not answer the read at all while answering that
+ *     it was ready: a read starting in it fails with LASER_ERR_IO at once,
+ *     and one reaching it is a short read stopping before it.
+ *     laser_unreadable_blocks() says how far the range goes. A LASER_ERR_IO
+ *     that is not the disc's - a drive not ready in time, a transport
+ *     failure - records nothing;
  *   - a block the drive refused, with a positional status: a refused command
  *     is read again in smaller ones down to that block, so that the blocks
  *     before it come back as a short read. A read reaching it stops before
@@ -523,7 +531,8 @@ int laser_read_blocks(int token, uint32_t lba, int num_blocks,
  * or the token is not registered.
  *
  * For a caller that reads such blocks as zeros rather than fail: after a
- * LASER_ERR_IO, the blocks to fill.
+ * LASER_ERR_IO, the blocks to fill. 0 after a LASER_ERR_IO means the failure
+ * was not the disc's: nothing to fill, the read is to be made again.
  */
 int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks);
 

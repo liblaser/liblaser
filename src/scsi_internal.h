@@ -165,6 +165,12 @@ typedef struct {
      * reached the sector and could not read it - not a drive that did not
      * answer, nor a transport failure. */
     int     medium_error;
+    /* The LASER_ERR_IO returned is the drive not answering a read at all -
+     * each attempt ending in a Reset Recovery - while answering a TEST UNIT
+     * READY that it is ready, or answering nothing since: stuck on those
+     * sectors, as on the unreadable ones some protections put on purpose.
+     * With medium_error, the two failures that are the disc's. */
+    int     no_answer;
     /* The last sense REQUEST SENSE read, 0xff/00/00 if none was. */
     uint8_t sense_key;
     uint8_t asc;
