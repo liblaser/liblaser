@@ -16,6 +16,7 @@ laser_public_symbols = [
     'laser_css_session_begin',
     'laser_css_session_end',
     'laser_read_blocks',
+    'laser_read_blocks_ahead',
     'laser_read_cd_blocks',
     'laser_status_is_positional',
     'laser_region_mismatch',

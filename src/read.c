@@ -394,12 +394,18 @@ int laser_refused_for_good(int token, uint32_t lba)
  * @param invalid_field optional, may be NULL: set to 1 when a chunk was
  *                   refused as malformed - ILLEGAL REQUEST, INVALID FIELD IN
  *                   CDB - and left alone otherwise
+ * @param ahead      whether the read is made ahead of any request, see
+ *                   laser_read_blocks_ahead() in laser.h: a chunk that fails
+ *                   is tried once, then given up - not narrowed down, not
+ *                   read again smaller, not recorded. The blocks before it
+ *                   are returned, and the blocks already known not to read
+ *                   are answered without the drive, as for any read.
  */
 static int read_chunked(int token, uint32_t lba, int num_blocks,
                         int block_size, int cdb_len,
                         build_read_cdb_fn build_cdb, const void *ctx,
                         uint8_t *buffer, const char *what, int refusals,
-                        int *invalid_field)
+                        int *invalid_field, int ahead)
 {
     if (num_blocks <= 0) {
         return 0;
@@ -472,7 +478,8 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
                 token, cdb, cdb_len,
                 buffer + (size_t)blocks_done * block_size,
                 chunk * block_size, /* data_in = */ 1, &actual_len,
-                medium_cap > 0 ? 1 : LASER_READ_MAX_MEDIUM_ERRORS,
+                medium_cap > 0 || ahead ? 1 : LASER_READ_MAX_MEDIUM_ERRORS,
+                ahead ? 1 : LASER_READ_MAX_RESETS,
                 &why);
 
         if (st != LASER_OK) {
@@ -491,7 +498,7 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
 
             /* A refusal fails the whole command: narrowed down to the
              * refused block, so that the blocks before it are returned. */
-            if (refusals && laser_status_is_positional(st) &&
+            if (refusals && !ahead && laser_status_is_positional(st) &&
                 entry != NULL) {
                 if (chunk > 1) {
                     refusal_cap = (chunk / 2) * block_size;
@@ -507,6 +514,12 @@ static int read_chunked(int token, uint32_t lba, int num_blocks,
             if (st == LASER_ERR_NO_KEY && entry != NULL) {
                 forget_refusals(entry, token,
                                 "the drive reports no CSS session in force");
+            }
+
+            /* Read ahead: one attempt was the whole of it. Whoever wants
+             * these blocks reads them with the patience they are worth. */
+            if (ahead) {
+                return blocks_done > 0 ? blocks_done : (int)st;
             }
 
             /* The drive reached the blocks and could not read them: the
@@ -611,7 +624,14 @@ int laser_read_blocks(int token, uint32_t lba, int num_blocks,
                       uint8_t *buffer)
 {
     return read_chunked(token, lba, num_blocks, 2048, 10,
-                        build_read10_cdb, NULL, buffer, "blocks", 1, NULL);
+                        build_read10_cdb, NULL, buffer, "blocks", 1, NULL, 0);
+}
+
+int laser_read_blocks_ahead(int token, uint32_t lba, int num_blocks,
+                            uint8_t *buffer)
+{
+    return read_chunked(token, lba, num_blocks, 2048, 10,
+                        build_read10_cdb, NULL, buffer, "blocks", 1, NULL, 1);
 }
 
 /* Bytes 1 and 9 of READ CD, resolved from the sector kind before the loop
@@ -715,7 +735,7 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
     int invalid_field = 0;
     int r = read_chunked(token, lba, num_blocks, block_size, 12,
                          build_read_cd_cdb, &ctx, buffer, "sectors", 0,
-                         &invalid_field);
+                         &invalid_field, 0);
 
     if (r == (int)LASER_ERR_REFUSED && invalid_field && audio &&
         ctx.expected_type != 0x00 && entry != NULL) {
@@ -724,7 +744,8 @@ int laser_read_cd_blocks(int token, uint32_t lba, int num_blocks,
         entry->cdda_any_type = 1;
         ctx.expected_type = 0x00;
         r = read_chunked(token, lba, num_blocks, block_size, 12,
-                         build_read_cd_cdb, &ctx, buffer, "sectors", 0, NULL);
+                         build_read_cd_cdb, &ctx, buffer, "sectors", 0, NULL,
+                         0);
     }
 
     return r;

@@ -525,6 +525,32 @@ int laser_read_blocks(int token, uint32_t lba, int num_blocks,
                       uint8_t *buffer);
 
 /**
+ * laser_read_blocks(), for a read made AHEAD of any request: a window a
+ * player fetches because the one before it was read, which nobody waits for
+ * and nobody may ever want.
+ *
+ * Some DVDs carry sectors unreadable on purpose, where no title plays: a
+ * player following the disc's navigation never asks for them, but a read
+ * ahead walks into them past the end of a cell. laser_read_blocks() there
+ * spends its retries, then narrows the failure down to the blocks at fault,
+ * for seconds during which the drive serves nobody else.
+ *
+ * So a chunk that fails here is tried ONCE and given up: no second attempt,
+ * no narrowing, no smaller transfers. And NOTHING IS RECORDED: one attempt
+ * proves little, a disc read poorly failing one in several. The blocks before
+ * the failure are returned as a short read; a failure on the first block is
+ * its status, which says only that these blocks are worth asking again, with
+ * laser_read_blocks(), once somebody wants them.
+ *
+ * Everything else is laser_read_blocks(): the return convention, the blocks
+ * already known not to read answered without the drive, the terminal
+ * statuses, and the abort check of the calling thread - which is how a read
+ * ahead is called off when the player jumps elsewhere.
+ */
+int laser_read_blocks_ahead(int token, uint32_t lba, int num_blocks,
+                            uint8_t *buffer);
+
+/**
  * How many blocks from @p lba, at most @p num_blocks, the disc is known not
  * to read: laser_read_blocks() or laser_read_cd_blocks() failed on them with
  * LASER_ERR_IO, and fails at once on them now. 0 if @p lba is not among them,

@@ -50,16 +50,6 @@
 #define LASER_MAX_RETRIES       6
 #define LASER_RETRY_DELAY_MS    500
 
-/* A read the drive did not answer at all, twice in a row - each time ending
- * in a Reset Recovery, some five seconds - is not retried further: a drive
- * stuck on a sector, as some are on a scrambled one read without CSS
- * authentication, does no better the next four times, and the full budget
- * turned one sector into half a minute.
- *
- * Most often the second attempt is not made either: the drive is asked
- * whether it is ready after the first, see unit_ready_after_reset_locked(). */
-#define LASER_READ_MAX_RESETS   2
-
 /* For a read - READ(10), READ CD - its first block and block count:
  * for the log, since which sectors failed tells which file, and so which
  * consumer, was reading; and for the throughput sample, which counts only
@@ -345,7 +335,7 @@ laser_status_t laser_scsi_cdb(int token,
 {
     return laser_scsi_cdb_read(token, cdb, cdb_len, data, data_len, data_in,
                                actual_len, LASER_READ_MAX_MEDIUM_ERRORS,
-                               NULL);
+                               LASER_READ_MAX_RESETS, NULL);
 }
 
 /* See scsi_internal.h. */
@@ -353,7 +343,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                                    const uint8_t *cdb, int cdb_len,
                                    uint8_t *data, int data_len,
                                    int data_in, int *actual_len,
-                                   int max_medium_errors,
+                                   int max_medium_errors, int max_resets,
                                    laser_failure_t *why)
 {
     if (why != NULL) {
@@ -538,6 +528,18 @@ laser_status_t laser_scsi_cdb_read(int token,
             if (is_read) {
                 resets_in_a_row++;
 
+                /* A read made ahead: nobody waits for these sectors, and
+                 * nothing will be held against them. Not asked which is to
+                 * blame, not read again. */
+                if (max_resets < LASER_READ_MAX_RESETS) {
+                    LOGI("token=%d: cdb 0x%02x%s - not answered, and read "
+                         "ahead: giving up on this read",
+                         token, cdb[0], where);
+                    reason_logged = 1;
+                    result = LASER_ERR_IO;
+                    break;
+                }
+
                 /* The drive, or these sectors? */
                 int ready = unit_ready_after_reset_locked(entry, &sense_key,
                                                           &asc, &ascq);
@@ -575,7 +577,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                 } else if (state == MEDIUM_SENSE_OTHER &&
                            !(asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
                              ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) &&
-                           resets_in_a_row >= LASER_READ_MAX_RESETS) {
+                           resets_in_a_row >= max_resets) {
                     LOGW("token=%d: cdb 0x%02x%s - the drive did not answer "
                          "%d times in a row (sense %02x/%02x/%02x), giving "
                          "up on this read", token, cdb[0], where,

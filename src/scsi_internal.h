@@ -62,6 +62,17 @@
  * with once each. */
 #define LASER_READ_MAX_MEDIUM_ERRORS 2
 
+/* A read the drive did not answer at all, twice in a row - each time ending
+ * in a Reset Recovery, some five seconds - is not retried further: a drive
+ * stuck on a sector, as some are on a scrambled one read without CSS
+ * authentication, does no better the next four times, and the full budget
+ * turned one sector into half a minute.
+ *
+ * Most often the second attempt is not made either: the drive is asked
+ * whether it is ready after the first, see unit_ready_after_reset_locked()
+ * in scsi.c. A read made ahead gives up at the first, unasked. */
+#define LASER_READ_MAX_RESETS   2
+
 /* Under ILLEGAL REQUEST, read after a refused START STOP UNIT: "no such
  * opcode" and "not in this shape" call for opposite next steps. */
 #define SCSI_ASC_INVALID_OPCODE         0x20
@@ -179,13 +190,15 @@ typedef struct {
 
 /* laser_scsi_cdb(), giving up on a read after @p max_medium_errors attempts
  * the drive answered with a medium error rather than
- * LASER_READ_MAX_MEDIUM_ERRORS - 1 for once - and saying why it failed
- * through @p why, if not NULL. */
+ * LASER_READ_MAX_MEDIUM_ERRORS - 1 for once - and after @p max_resets
+ * attempts it did not answer at all rather than LASER_READ_MAX_RESETS - 1
+ * for a read made ahead - and saying why it failed through @p why, if not
+ * NULL. */
 laser_status_t laser_scsi_cdb_read(int token,
                                    const uint8_t *cdb, int cdb_len,
                                    uint8_t *data, int data_len,
                                    int data_in, int *actual_len,
-                                   int max_medium_errors,
+                                   int max_medium_errors, int max_resets,
                                    laser_failure_t *why);
 
 /* One command, without the retries of laser_scsi_cdb(), and why it failed:
