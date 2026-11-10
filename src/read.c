@@ -136,14 +136,39 @@ static int known_bad_block(laser_entry_t *entry, uint32_t lba, int *chunk,
     return status;
 }
 
+/* A run touching one already known extends it rather than take a slot: the
+ * unreadable sectors a protection puts on a disc come in regions of hundreds,
+ * met a few blocks at a time, and sixteen slots of their own would hold the
+ * last sixteen reads' worth of one region, the rest asked of the drive
+ * again. */
 static void remember_unreadable(laser_entry_t *entry, int token, uint32_t lba,
                                 int count)
 {
+    const uint64_t start = lba;
+    const uint64_t end = start + (uint64_t)count;
+    int merged = 0;
+
     pthread_mutex_lock(&entry->io_lock);
-    entry->unreadable[entry->unreadable_next].lba = lba;
-    entry->unreadable[entry->unreadable_next].count = (uint32_t)count;
-    entry->unreadable_next = (entry->unreadable_next + 1) %
-                             LASER_UNREADABLE_SLOTS;
+    for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS; i++) {
+        const uint64_t run_start = entry->unreadable[i].lba;
+        const uint64_t run_end = run_start + entry->unreadable[i].count;
+        if (entry->unreadable[i].count == 0 || start > run_end ||
+            end < run_start) {
+            continue;
+        }
+        const uint64_t new_start = start < run_start ? start : run_start;
+        const uint64_t new_end = end > run_end ? end : run_end;
+        entry->unreadable[i].lba = (uint32_t)new_start;
+        entry->unreadable[i].count = (uint32_t)(new_end - new_start);
+        merged = 1;
+        break;
+    }
+    if (!merged) {
+        entry->unreadable[entry->unreadable_next].lba = lba;
+        entry->unreadable[entry->unreadable_next].count = (uint32_t)count;
+        entry->unreadable_next = (entry->unreadable_next + 1) %
+                                 LASER_UNREADABLE_SLOTS;
+    }
     pthread_mutex_unlock(&entry->io_lock);
 
     LOGW("token=%d: LBA %u x %d unreadable, not asked for again until the "

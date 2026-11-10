@@ -5,6 +5,7 @@ XXXX-XX-XX: version 0.3.2
     - Tell every consumer of a drive that its disc changed
     - Record blocks as unreadable only when the disc is to blame
     - Give START STOP UNIT without IMMED the time of a spin-up
+    - Merge the unreadable ranges that touch
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/
