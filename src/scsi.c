@@ -115,6 +115,14 @@ static int request_sense_locked(laser_entry_t *entry,
     return 0;
 }
 
+/* Whether this command does its work before its status, with no data phase
+ * to wait in: see laser_entry_t::slow_status. START STOP UNIT (1Bh) without
+ * IMMED - with it, the drive answers at once and works afterwards. */
+static int cdb_status_is_slow(const uint8_t *cdb, int cdb_len)
+{
+    return cdb_len >= 6 && cdb[0] == 0x1b && (cdb[1] & 0x01) == 0;
+}
+
 /* See scsi_internal.h. */
 int laser_command_locked(laser_entry_t *entry, const uint8_t *cdb,
                          int cdb_len, uint8_t *data, int data_len,
@@ -122,8 +130,10 @@ int laser_command_locked(laser_entry_t *entry, const uint8_t *cdb,
                          uint8_t *sense_key, uint8_t *asc, uint8_t *ascq)
 {
     int status = -1;
+    entry->slow_status = cdb_status_is_slow(cdb, cdb_len);
     int rc = laser_bot_send_locked(entry, cdb, cdb_len, data, data_len,
                                    data_len > 0, actual_len, &status);
+    entry->slow_status = 0;
     if (csw_status != NULL)
         *csw_status = status;
 
@@ -479,8 +489,10 @@ laser_status_t laser_scsi_cdb_read(int token,
         struct timespec xfer_started;
         clock_gettime(CLOCK_MONOTONIC, &xfer_started);
 
+        entry->slow_status = cdb_status_is_slow(cdb, cdb_len);
         int rc = laser_bot_send_locked(entry, cdb, cdb_len, data, data_len,
                                          data_in, actual_len, &csw_status);
+        entry->slow_status = 0;
         if (rc == 0) {
             /* A success after retries is logged: otherwise a drive limping
              * through its budget on every command looks, in the log, like

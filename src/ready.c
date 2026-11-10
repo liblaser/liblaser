@@ -176,7 +176,8 @@ void laser_allow_medium_removal(laser_entry_t *entry)
  *   2b. 02h/04h NOT READY, BECOMING READY: stop. The drive is already
  *       loading, and the caller's wait covers that.
  *   2c. 05h/24h INVALID FIELD IN CDB: retry without IMMED, the field ATAPI
- *       bridges most often lack. This one may block for the whole spin-up.
+ *       bridges most often lack. This one may block for the whole spin-up,
+ *       and is given the time: see SLOW_CSW_PHASE_TIMEOUT_MS in bot.c.
  *   2d. anything else: retry with LOEJ, "load the medium" being a different
  *       request from "spin what you have". A 05h/24h answer to that names
  *       LOEJ, so the ladder ends there: a drive with no motorised load

@@ -93,6 +93,16 @@ _Static_assert(sizeof(bot_csw_t) == USB_BOT_CSW_SIZE,
 #define DATA_PHASE_TIMEOUT_MS   5000
 #define CSW_PHASE_TIMEOUT_MS    3000
 
+/* Except for a command that has no data phase and does its work before its
+ * status: the status phase is then where the drive is waited for. START STOP
+ * UNIT without IMMED answers once the disc spins, and at three seconds it
+ * was cut by a Reset Recovery in the middle of every spin-up longer than
+ * that. The spin-up wait's own ceiling (LASER_SPINUP_MAX_WALL_MS in
+ * ready.c).
+ *
+ * Used while entry->slow_status is set, under io_lock. */
+#define SLOW_CSW_PHASE_TIMEOUT_MS  15000
+
 /* Timeouts for PROBES - commands a working device answers at once, with or
  * without a medium (INQUIRY). Under the read timeouts, a device answering
  * nothing cost seconds per attempt to establish so, on every browse.
@@ -201,6 +211,8 @@ int laser_bot_send_locked(laser_entry_t *entry,
                                     : DATA_PHASE_TIMEOUT_MS;
     const unsigned int csw_timeout = entry->probe_timeouts
                                    ? PROBE_CSW_PHASE_TIMEOUT_MS
+                                   : entry->slow_status
+                                   ? SLOW_CSW_PHASE_TIMEOUT_MS
                                    : CSW_PHASE_TIMEOUT_MS;
 
     /* laser_scsi_cdb() already rejects this, but the memcpy below is the

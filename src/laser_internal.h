@@ -257,6 +257,12 @@ typedef struct {
      * the command, under io_lock. */
     int probe_timeouts;
 
+    /** Nonzero while a command that does its work before its status, with
+     * no data phase to wait in, is in flight - START STOP UNIT without
+     * IMMED, which answers once the disc spins: lengthens the BOT status
+     * timeout. Set and cleared around the command, under io_lock. */
+    int slow_status;
+
     /* Logical Unit to address in every CBW. Almost always 0, but a combo
      * enclosure may put its card reader there and the optical drive on
      * another unit. Chosen at registration by laser_probe_lun(). */
