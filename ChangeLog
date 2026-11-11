@@ -22,6 +22,7 @@ XXXX-XX-XX: version 0.3.2
     - Do not take the media event of a drive's power-up for a change of disc
     - Log the read commands a consumer's stay cost the drive
     - Take a deferred medium error for the answer to the read it follows
+    - Return the blocks a drive sent before it stopped answering a read
     - Add laser_set_speed(), to ask a drive to spin a disc slower
 
 2026-11-05: version 0.3.1

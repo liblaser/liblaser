@@ -424,6 +424,7 @@ laser_status_t laser_scsi_cdb_read(int token,
         why->sense_key = 0xff;
         why->asc = 0;
         why->ascq = 0;
+        why->received = 0;
     }
 
     /* Caller bugs, caught here because their symptoms appear far from the
@@ -534,8 +535,11 @@ laser_status_t laser_scsi_cdb_read(int token,
     int resets_in_a_row = 0;
     int medium_errors = 0;
 
-    /* Whether an attempt of this read went unanswered. */
+    /* Whether an attempt of this read went unanswered, and the most bytes
+     * one had received by then: see laser_failure_t::received. An attempt
+     * receiving fewer wrote the same sectors over the start of the buffer. */
     int unanswered = 0;
+    int received = 0;
 
     /* Whether the drive, stopped, has been told to start: once a command. */
     int start_sent = 0;
@@ -610,6 +614,10 @@ laser_status_t laser_scsi_cdb_read(int token,
             if (is_read) {
                 resets_in_a_row++;
                 unanswered = 1;
+                if (data_in && actual_len != NULL && *actual_len > received &&
+                    *actual_len < data_len) {
+                    received = *actual_len;
+                }
 
                 /* A read made ahead: nobody waits for these sectors, and
                  * nothing will be held against them. Not asked which is to
@@ -958,6 +966,8 @@ laser_status_t laser_scsi_cdb_read(int token,
         why->sense_key = last_sense_key;
         why->asc = last_asc;
         why->ascq = last_ascq;
+        if (result == LASER_ERR_IO)
+            why->received = received;
     }
 
     pthread_mutex_unlock(&entry->io_lock);

@@ -554,10 +554,16 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
             const int tried = chunk * block_size;
             int smaller = 0;
 
+            /* The blocks of this chunk the drive sent before it stopped
+             * answering: read, as far as they go. */
+            const int sent = st == LASER_ERR_IO ? why.received / block_size
+                                                : 0;
+
             if (entry == NULL || ahead) {
                 /* Read ahead: one attempt was the whole of it. Whoever
                  * wants these blocks reads them with the patience they are
                  * worth. And nowhere to record without an entry. */
+                blocks_done += sent;
             } else if (refusals && laser_status_is_positional(st)) {
                 /* A refusal fails the whole command: narrowed down to the
                  * refused block, so that the blocks before it are
@@ -607,8 +613,14 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                  * LASER_ERR_IO - a drive not ready within its budget, a
                  * transport failing - says nothing of the blocks, and
                  * recording them would have every consumer take them for
-                 * unreadable until the disc changes. */
-                remember_unreadable(entry, token, at, chunk);
+                 * unreadable until the disc changes.
+                 *
+                 * From the first block the drive did not send: those it
+                 * sent before stopping are returned, not lost with the
+                 * rest of the chunk. */
+                remember_unreadable(entry, token, at + (uint32_t)sent,
+                                    chunk - sent);
+                blocks_done += sent;
             }
 
             if (smaller > 0) {

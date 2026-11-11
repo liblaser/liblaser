@@ -311,6 +311,12 @@ int laser_bot_send_locked(laser_entry_t *entry,
                                  "device still mid-transfer, performing Reset Recovery",
                           transferred, data_len);
                 laser_mass_storage_reset(entry);
+                /* What arrived is what the device sent, and is in the
+                 * buffer: for a read, the sectors before the one the
+                 * drive stopped on. */
+                if (actual_len && data_in) {
+                    *actual_len = transferred;
+                }
                 return BOT_FAIL_PHASE_ERROR;
             }
         } else if (ret == LIBUSB_ERROR_NO_DEVICE) {

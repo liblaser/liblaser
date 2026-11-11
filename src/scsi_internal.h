@@ -221,6 +221,10 @@ typedef struct {
     uint8_t sense_key;
     uint8_t asc;
     uint8_t ascq;
+    /* Of a read the drive stopped answering in the middle of: the bytes it
+     * had sent by then, which are in the caller's buffer - the sectors
+     * before the one it stopped on. 0 otherwise. */
+    int received;
 } laser_failure_t;
 
 /* laser_scsi_cdb(), giving up on a read after @p max_medium_errors attempts
