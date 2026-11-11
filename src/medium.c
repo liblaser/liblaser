@@ -515,6 +515,17 @@ static laser_status_t media_poll_entry(laser_entry_t *entry, int token,
     if (st == LASER_ERR_REFUSED)
         st = media_from_unit_ready(entry, out);
 
+    /* A tray opened or closed with no event to say so - as a drive does
+     * with no disc in it - is otherwise nowhere in the log, and a disc put
+     * in and never found reads as a tray never touched. With an event, the
+     * event's own line says where the tray is. */
+    if (st == LASER_OK && out->tray_open != entry->tray_open_seen) {
+        entry->tray_open_seen = out->tray_open;
+        if (out->event == LASER_MEDIA_NO_EVENT)
+            LOGI("token=%d: tray %s", token,
+                 out->tray_open ? "opened" : "closed");
+    }
+
     /* Another disc, or none: the blocks known not to read were the last
      * one's, and its consumers are told (laser_media_generation()). */
     if (st == LASER_OK && (out->event == LASER_MEDIA_NEW ||

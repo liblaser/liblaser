@@ -363,6 +363,11 @@ typedef struct {
      * io_lock. */
     int64_t         last_failure_ms;
 
+    /* Whether the last media poll found the tray open, for the log to say
+     * when it moves: see media_poll_entry(). Read and written by the
+     * polls only. */
+    atomic_int      tray_open_seen;
+
     /* Set once the unit's state has come as deferred sense, for the log to
      * say so once: see request_sense_locked(). Under io_lock. */
     int             deferred_state_noted;
