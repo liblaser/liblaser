@@ -579,9 +579,12 @@ laser_status_t laser_scsi_cdb_read(int token,
             }
             /* Only a read following the previous one is a sample: a seek
              * costs what a slow link does, and a classification - the UDF
-             * walk, the IFOs - is mostly seeks. */
+             * walk, the IFOs - is mostly seeks. And only a READ(10): READ CD
+             * is of a CD, which a drive reads at a few times its 176 KiB/s,
+             * well under the rate a DVD or a BD on a starved drive is told
+             * by - a Video CD read at 694 KiB/s was reported as one. */
             if (is_read) {
-                if (read_lba == entry->xfer_next_lba)
+                if (read_lba == entry->xfer_next_lba && cdb[0] == 0x28)
                     sample_throughput_locked(entry, data_len, &xfer_started);
                 entry->xfer_next_lba = read_lba + read_count;
                 entry->unanswered_count = 0;

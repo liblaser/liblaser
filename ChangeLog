@@ -23,6 +23,7 @@ XXXX-XX-XX: version 0.3.2
     - Log the read commands a consumer's stay cost the drive
     - Take a deferred medium error for the answer to the read it follows
     - Return the blocks a drive sent before it stopped answering a read
+    - Do not take a CD's reading speed for an underpowered drive's
     - Add laser_set_speed(), to ask a drive to spin a disc slower
 
 2026-11-05: version 0.3.1
