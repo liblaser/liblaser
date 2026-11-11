@@ -18,6 +18,8 @@
 #                         only includes config.h behind HAVE_CONFIG_H, which is
 #                         never defined here.
 #   tools/confine.py    - the symbol confinement step, see src/meson.build.
+#   tests/              - the tests, against simulated devices: built with
+#                         -Dtests=true, see tests/meson.build.
 #
 # The vendored trees are upstream's as released, so they are described here
 # rather than given a meson.build of their own.
@@ -84,3 +86,7 @@ confine = find_program('tools/confine.py')
 # The public headers first: src/ compiles against them.
 subdir('include')
 subdir('src')
+
+if get_option('tests')
+    subdir('tests')
+endif

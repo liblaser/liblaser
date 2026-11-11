@@ -3,7 +3,8 @@ XXXX-XX-XX: version 0.3.2
     - Fallback to read CD-DA as any sector type when a drive refuses the CD-DA form
     - Narrow a medium error down to the blocks that do not read
     - Add laser_set_speed(), to ask a drive to spin a disc slower
-    - Optimizations and compatibility fixes
+    - Optimizations and compatibility fixes (Fable 5.2 review)
+    - Add unit test
 
 2026-11-05: version 0.3.1
     - Move the public headers to include/
