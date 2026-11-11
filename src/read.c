@@ -285,6 +285,7 @@ void laser_disc_changed_locked(laser_entry_t *entry)
     entry->unreadable_next = 0;
     memset(entry->refused, 0, sizeof(entry->refused));
     pthread_mutex_unlock(&entry->learnt_lock);
+    entry->unanswered_count = 0;
     entry->media_generation++;
 
     if (count > 0) {

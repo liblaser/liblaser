@@ -82,11 +82,27 @@ static int describe_read(const uint8_t *cdb, int cdb_len, char *buf, size_t size
     return 1;
 }
 
+/* Deferred sense: the failure of a command that had already ended, told in
+ * answer to another. */
+typedef struct {
+    uint8_t  sense_key;     /* 0xff: none */
+    uint8_t  asc;
+    uint8_t  ascq;
+    int      lba_valid;     /* fixed format, with its VALID bit */
+    uint32_t lba;           /* the INFORMATION field: the sector, for a read */
+} deferred_sense_t;
+
 /* REQUEST SENSE (opcode 0x03) - decode the reason for the previous CHECK
- * CONDITION. Caller MUST already hold entry->io_lock. */
+ * CONDITION. Deferred sense is not that reason, and goes to @p deferred,
+ * unless NULL. Caller MUST already hold entry->io_lock. */
 static int request_sense_locked(laser_entry_t *entry,
-                                uint8_t *sense_key, uint8_t *asc, uint8_t *ascq)
+                                uint8_t *sense_key, uint8_t *asc, uint8_t *ascq,
+                                deferred_sense_t *deferred)
 {
+    if (deferred != NULL) {
+        *deferred = (deferred_sense_t){ .sense_key = 0xff };
+    }
+
     uint8_t cdb[6] = { 0x03, 0x00, 0x00, 0x00, 0x18, 0x00 };
     uint8_t buffer[24] = {0};
     int actual_len = 0;
@@ -100,10 +116,11 @@ static int request_sense_locked(laser_entry_t *entry,
      *
      *   70h  fixed format, of the command that just failed
      *   72h  descriptor format, likewise: key, ASC and ASCQ lead it
-     *   71h, 73h  DEFERRED: of a command that had already answered - a
-     *        cached write, most often. It says nothing of the one that just
-     *        failed, and read as its sense it would send the retry policy
-     *        after the wrong cause.
+     *   71h, 73h  DEFERRED: of a command that had already ended - a cached
+     *        write, or a read given up on, which the drive went on with. It
+     *        is not the sense of the one that just failed, which was not
+     *        executed; what it says of an earlier read is the caller's to
+     *        make out, see laser_scsi_cdb_read().
      *
      * Any other code is read as fixed format, as every code was before:
      * a bridge that answers the right bytes under a wrong code keeps its
@@ -127,13 +144,33 @@ static int request_sense_locked(laser_entry_t *entry,
         *ascq = buffer[3];
         return 0;
     case 0x71:
-    case 0x73:
-        LOGW("token=%d: deferred sense %02x/%02x/%02x, of an earlier "
-             "command: not read as this one's", entry->token,
-             (buffer[0] & 0x7f) == 0x71 ? buffer[2] & 0x0f : buffer[1] & 0x0f,
-             (buffer[0] & 0x7f) == 0x71 ? buffer[12] : buffer[2],
-             (buffer[0] & 0x7f) == 0x71 ? buffer[13] : buffer[3]);
+    case 0x73: {
+        deferred_sense_t d = { .sense_key = 0xff };
+        if ((buffer[0] & 0x7f) == 0x71 && actual_len >= 14) {
+            d.sense_key = buffer[2] & 0x0f;
+            d.asc       = buffer[12];
+            d.ascq      = buffer[13];
+            d.lba_valid = (buffer[0] & 0x80) != 0;
+            d.lba       = (uint32_t)buffer[3] << 24 | (uint32_t)buffer[4] << 16 |
+                          (uint32_t)buffer[5] << 8 | buffer[6];
+        } else if ((buffer[0] & 0x7f) == 0x73 && actual_len >= 4) {
+            d.sense_key = buffer[1] & 0x0f;
+            d.asc       = buffer[2];
+            d.ascq      = buffer[3];
+        }
+        if (d.lba_valid) {
+            LOGW("token=%d: deferred sense %02x/%02x/%02x at LBA %u, of an "
+                 "earlier command", entry->token, d.sense_key, d.asc, d.ascq,
+                 (unsigned)d.lba);
+        } else {
+            LOGW("token=%d: deferred sense %02x/%02x/%02x, of an earlier "
+                 "command", entry->token, d.sense_key, d.asc, d.ascq);
+        }
+        if (deferred != NULL) {
+            *deferred = d;
+        }
         return -1;
+    }
     }
 }
 
@@ -164,7 +201,7 @@ int laser_command_locked(laser_entry_t *entry, const uint8_t *cdb,
         *asc = 0;
         *ascq = 0;
         if (rc != 0 && status == USB_BOT_STATUS_FAIL)
-            request_sense_locked(entry, sense_key, asc, ascq);
+            request_sense_locked(entry, sense_key, asc, ascq, NULL);
     }
     return rc;
 }
@@ -497,6 +534,9 @@ laser_status_t laser_scsi_cdb_read(int token,
     int resets_in_a_row = 0;
     int medium_errors = 0;
 
+    /* Whether an attempt of this read went unanswered. */
+    int unanswered = 0;
+
     /* Whether the drive, stopped, has been told to start: once a command. */
     int start_sent = 0;
 
@@ -540,6 +580,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                 if (read_lba == entry->xfer_next_lba)
                     sample_throughput_locked(entry, data_len, &xfer_started);
                 entry->xfer_next_lba = read_lba + read_count;
+                entry->unanswered_count = 0;
             }
             result = LASER_OK;
             break;
@@ -568,14 +609,18 @@ laser_status_t laser_scsi_cdb_read(int token,
                  "%d/%d)", token, cdb[0], where, attempt, LASER_MAX_RETRIES);
             if (is_read) {
                 resets_in_a_row++;
+                unanswered = 1;
 
                 /* A read made ahead: nobody waits for these sectors, and
                  * nothing will be held against them. Not asked which is to
-                 * blame, not read again. */
+                 * blame, not read again - but remembered until the next
+                 * read, for what the drive may yet say of it. */
                 if (max_resets < LASER_READ_MAX_RESETS) {
                     LOGI("token=%d: cdb 0x%02x%s - not answered, and read "
                          "ahead: giving up on this read",
                          token, cdb[0], where);
+                    entry->unanswered_lba = read_lba;
+                    entry->unanswered_count = read_count;
                     reason_logged = 1;
                     result = LASER_ERR_IO;
                     break;
@@ -634,10 +679,49 @@ laser_status_t laser_scsi_cdb_read(int token,
                 }
             }
         } else if (csw_status == USB_BOT_STATUS_FAIL) {
-            request_sense_locked(entry, &sense_key, &asc, &ascq);
+            deferred_sense_t deferred;
+            request_sense_locked(entry, &sense_key, &asc, &ascq, &deferred);
             last_sense_key = sense_key;
             last_asc = asc;
             last_ascq = ascq;
+
+            /* A drive given up on while it tries a sector again goes on
+             * trying - a Reset Recovery resets the bridge, not the drive -
+             * answers nothing meanwhile, and when it is done says how it
+             * ended to the command that comes next, as deferred sense. To a
+             * read that has itself gone unanswered, or to the first read of
+             * sectors a read-ahead was not answered for, a deferred MEDIUM
+             * ERROR is the answer that was waited for: these sectors do not
+             * read, and asking again starts the drive on them again, for as
+             * long - a quarter of a minute a time, on the sectors a
+             * protection puts on a disc for this.
+             *
+             * Not when it names a sector outside the read: then it ends a
+             * read given up on elsewhere, and this one is sent again, as
+             * for any deferred sense. */
+            const int asked_before = unanswered ||
+                (entry->unanswered_count != 0 &&
+                 read_lba < entry->unanswered_lba + entry->unanswered_count &&
+                 entry->unanswered_lba < read_lba + read_count);
+            if (is_read && asked_before &&
+                deferred.sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR &&
+                !(deferred.lba_valid && (deferred.lba < read_lba ||
+                                         deferred.lba - read_lba >= read_count))) {
+                LOGW("token=%d: cdb 0x%02x%s - not answered, and the drive "
+                     "says since that it could not read (%02x/%02x/%02x): "
+                     "these sectors, giving up on this read", token, cdb[0],
+                     where, deferred.sense_key, deferred.asc, deferred.ascq);
+                last_sense_key = deferred.sense_key;
+                last_asc = deferred.asc;
+                last_ascq = deferred.ascq;
+                entry->unanswered_count = 0;
+                reason_logged = 1;
+                result = LASER_ERR_IO;
+                if (why != NULL) {
+                    why->cause = LASER_FAILURE_NO_ANSWER;
+                }
+                break;
+            }
         }
 
         if (rc != BOT_FAIL_PHASE_ERROR)

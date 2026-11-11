@@ -363,6 +363,13 @@ typedef struct {
      * io_lock. */
     int64_t         last_failure_ms;
 
+    /* The last read given up unanswered with nothing asked of the drive
+     * since - a read made ahead: the sectors a deferred MEDIUM ERROR
+     * answered to the next read of them is about, see laser_scsi_cdb_read().
+     * A count of 0: none. Under io_lock. */
+    uint32_t        unanswered_lba;
+    uint32_t        unanswered_count;
+
     /* The read commands sent since a consumer last came or went, for the
      * log of the next one to go: see laser_log_reads(). Counted without a
      * lock, by commands the drive takes one at a time. */
