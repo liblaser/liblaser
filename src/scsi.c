@@ -122,6 +122,15 @@ static int request_sense_locked(laser_entry_t *entry,
      *        executed; what it says of an earlier read is the caller's to
      *        make out, see laser_scsi_cdb_read().
      *
+     *        Unless it tells the state of the unit rather than the outcome
+     *        of a command - NOT READY, UNIT ATTENTION: no medium, a tray
+     *        open, a disc changed. That is why this command was not
+     *        executed, as true of it as of the one before, and some
+     *        firmware answers every command so for as long as the state
+     *        lasts: a drive with an empty tray, after a disc was taken out.
+     *        Dropped, it left the wait for a medium without the one answer
+     *        that ends it, to run its whole budget.
+     *
      * Any other code is read as fixed format, as every code was before:
      * a bridge that answers the right bytes under a wrong code keeps its
      * sense. On -1 the caller's values are left as they were, "no sense". */
@@ -157,6 +166,20 @@ static int request_sense_locked(laser_entry_t *entry,
             d.sense_key = buffer[1] & 0x0f;
             d.asc       = buffer[2];
             d.ascq      = buffer[3];
+        }
+        if (d.sense_key == SCSI_SENSE_KEY_NOT_READY ||
+            d.sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION) {
+            if (!entry->deferred_state_noted) {
+                entry->deferred_state_noted = 1;
+                LOG_QUIRK(entry, "the state of the unit (%02x/%02x/%02x) "
+                          "reported as deferred sense: read as this "
+                          "command's (further occurrences not logged)",
+                          d.sense_key, d.asc, d.ascq);
+            }
+            *sense_key = d.sense_key;
+            *asc = d.asc;
+            *ascq = d.ascq;
+            return 0;
         }
         if (d.lba_valid) {
             LOGW("token=%d: deferred sense %02x/%02x/%02x at LBA %u, of an "
