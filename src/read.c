@@ -183,12 +183,16 @@ static void remember_unreadable(laser_entry_t *entry, int token, uint32_t lba,
         }
         const uint64_t new_start = start < run_start ? start : run_start;
         const uint64_t new_end = end > run_end ? end : run_end;
+        /* Counted: the blocks the range gains, not those it already had. */
+        entry->unreadable_total += (unsigned)((new_end - new_start) -
+                                              (run_end - run_start));
         entry->unreadable[i].lba = (uint32_t)new_start;
         entry->unreadable[i].count = (uint32_t)(new_end - new_start);
         merged = 1;
         break;
     }
     if (!merged) {
+        entry->unreadable_total += (unsigned)count;
         entry->unreadable[entry->unreadable_next].lba = lba;
         entry->unreadable[entry->unreadable_next].count = (uint32_t)count;
         entry->unreadable_next = (entry->unreadable_next + 1) %
@@ -283,6 +287,7 @@ void laser_disc_changed_locked(laser_entry_t *entry)
 
     memset(entry->unreadable, 0, sizeof(entry->unreadable));
     entry->unreadable_next = 0;
+    entry->unreadable_total = 0;
     memset(entry->refused, 0, sizeof(entry->refused));
     pthread_mutex_unlock(&entry->learnt_lock);
     entry->unanswered_count = 0;
@@ -330,6 +335,21 @@ int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks)
 
     laser_unpin(entry);
     return count;
+}
+
+unsigned laser_unreadable_total(int token)
+{
+    laser_entry_t *entry = laser_pin(token);
+    if (entry == NULL) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&entry->learnt_lock);
+    const unsigned total = entry->unreadable_total;
+    pthread_mutex_unlock(&entry->learnt_lock);
+
+    laser_unpin(entry);
+    return total;
 }
 
 int laser_refused_for_good(int token, uint32_t lba)

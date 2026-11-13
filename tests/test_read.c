@@ -130,6 +130,7 @@ static void fresh_disc(void)
     memset(entry.unreadable, 0, sizeof(entry.unreadable));
     memset(entry.refused, 0, sizeof(entry.refused));
     entry.unreadable_next = 0;
+    entry.unreadable_total = 0;
     entry.largest_ok_bytes = 65536;
     entry.max_transfer_bytes = 65536;
     entry.cap_strike_bytes = 0;
@@ -153,14 +154,18 @@ static void medium_error_is_narrowed_and_recorded(void)
     bad_hi = 104;
 
     /* The blocks before it are returned, and it alone is recorded. */
+    CHECK(laser_unreadable_total(1) == 0);
     CHECK(laser_read_blocks(1, 0, 128, buffer) == 100);
     CHECK(recorded_ranges() == 1);
     CHECK(laser_unreadable_blocks(1, 100, 128) == 4);
+    CHECK(laser_unreadable_total(1) == 4);
 
     /* Asked for again, it is answered without the drive. */
     commands = 0;
     CHECK(laser_read_blocks(1, 100, 28, buffer) == LASER_ERR_IO);
     CHECK(commands == 0);
+    /* And not counted again. */
+    CHECK(laser_unreadable_total(1) == 4);
 }
 
 static void ranges_that_touch_are_merged(void)
@@ -182,6 +187,8 @@ static void ranges_that_touch_are_merged(void)
 
     CHECK(recorded_ranges() == 1);
     CHECK(laser_unreadable_blocks(1, 200, 4096) == 64);
+    /* Each block once, however the range grew. */
+    CHECK(laser_unreadable_total(1) == 64);
 }
 
 static void unanswered_read_is_recorded(void)
@@ -194,6 +201,8 @@ static void unanswered_read_is_recorded(void)
 
     CHECK(laser_read_blocks(1, 32, 32, buffer) == LASER_ERR_IO);
     CHECK(recorded_ranges() == 1);
+    /* Not narrowed down: the whole transfer is given up, and counted. */
+    CHECK(laser_unreadable_total(1) == 32);
 }
 
 static void other_failure_records_nothing(void)
@@ -254,9 +263,11 @@ static void disc_change_forgets_everything(void)
     laser_read_blocks(1, 100, 4, buffer);
     CHECK(recorded_ranges() == 1);
 
+    CHECK(laser_unreadable_total(1) == 4);
     const unsigned generation = entry.media_generation;
     laser_forget_disc(&entry, 1);
     CHECK(recorded_ranges() == 0);
+    CHECK(laser_unreadable_total(1) == 0);
     CHECK(entry.media_generation == generation + 1);
 }
 

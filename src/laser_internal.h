@@ -168,6 +168,11 @@ typedef struct {
     } unreadable[LASER_UNREADABLE_SLOTS];
     unsigned unreadable_next;
 
+    /* The blocks recorded there since the disc was put in, each once: see
+     * laser_unreadable_total() in laser.h. Unlike the table, which forgets
+     * its oldest range for a new one, it only grows. Under learnt_lock. */
+    unsigned unreadable_total;
+
     /* Single blocks a READ(10) was refused on - a positional status, see
      * laser_status_is_positional() - with the status, and how many times:
      * 0 hits for an empty slot. A read reaching one stops short of it; one

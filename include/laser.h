@@ -605,6 +605,29 @@ int laser_read_blocks_ahead(int token, uint32_t lba, int num_blocks,
 int laser_unreadable_blocks(int token, uint32_t lba, int num_blocks);
 
 /**
+ * How many blocks of the disc in the drive have been found not to read,
+ * since it was put in: every block laser_unreadable_blocks() has come to
+ * answer for, counted once, whichever consumer of the token met it. Back to
+ * 0 when the disc changes; 0 if the token is not registered.
+ *
+ * For telling a user how damaged a disc is proving: read before and after a
+ * playback, the difference is what that playback found. It is not what it
+ * crossed: a block found by an earlier playback, or by a classification, is
+ * answered without the drive from then on and is not counted again.
+ *
+ * It counts what was given up on, which can be more than what is damaged. A
+ * medium error is narrowed down to the blocks that do not read; a read the
+ * drive did not answer at all is not, each attempt costing its timeout, and
+ * counts from the first block that did not arrive to the end of its
+ * transfer - up to 32 blocks for one bad sector, as on the sectors a copy
+ * protection makes unreadable.
+ *
+ * The blocks a drive refuses - scrambled, and read without authentication -
+ * are not among them: see laser_refused_for_good().
+ */
+unsigned laser_unreadable_total(int token);
+
+/**
  * Whether the drive has refused the block @p lba often enough that
  * laser_read_blocks() now answers a read starting on it with the refusal,
  * without the drive: 1 if so, 0 otherwise, or if the token is not

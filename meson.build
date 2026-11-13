@@ -25,7 +25,7 @@
 # rather than given a meson.build of their own.
 
 project('liblaser', 'c',
-    version: '0.3.1',
+    version: '0.3.2',
     license: 'LGPL-2.1-or-later',
     meson_version: '>= 0.60.0',
     # GNU C11: _Static_assert in bot.c, and ##__VA_ARGS__ in LOG_QUIRK().

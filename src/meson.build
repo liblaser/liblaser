@@ -21,6 +21,7 @@ laser_public_symbols = [
     'laser_status_is_positional',
     'laser_region_mismatch',
     'laser_unreadable_blocks',
+    'laser_unreadable_total',
     'laser_refused_for_good',
     'laser_capacity',
     'laser_disc_identify',
