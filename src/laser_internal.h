@@ -199,6 +199,16 @@ typedef struct {
      * sees it at its next look. */
     atomic_uint media_generation;
 
+    /* Whether laser_media_lock() locked the tray, and it has not been seen
+     * open since: no disc can go in or out meanwhile. A drive coming out of
+     * standby reports a new medium - a NewMedia event, a MEDIUM MAY HAVE
+     * CHANGED - for the disc it already had; while this is set, that is
+     * not taken for a change of disc. Cleared by an unlock, and by a tray
+     * seen open, should the drive have dropped the lock - a reset does.
+     *
+     * Written and read without a lock. */
+    atomic_int tray_locked;
+
     /* Operations in progress on this entry: laser_pin() and laser_unpin().
      * The teardown waits for it to fall to 0 before it frees the slot.
      *

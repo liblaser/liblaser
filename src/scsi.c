@@ -547,6 +547,8 @@ laser_status_t laser_scsi_cdb_read(int token,
 
     /* Set by the first 04h/01h BECOMING READY: see its branch below. */
     int becoming_ready = 0;
+    /* A MEDIUM MAY HAVE CHANGED taken, tray locked, for a wake-up: once. */
+    int woke_locked = 0;
     int64_t becoming_ready_since = 0;
 
     /* Which sectors a read asks for, appended to its messages; and its
@@ -785,6 +787,16 @@ laser_status_t laser_scsi_cdb_read(int token,
                      "retrying cdb 0x%02x", token, cdb[0]);
                 becoming_ready = 0;
                 entry->wait_state = LASER_WAIT_READY;
+                attempt--;
+                continue;
+            }
+            /* With the tray locked, no disc went in or out: a drive back
+             * from standby without having said it was becoming ready.
+             * Retried at once, once. */
+            if (entry->tray_locked && !woke_locked) {
+                LOGI("token=%d: medium may have changed, tray locked - the "
+                     "drive waking, retrying cdb 0x%02x", token, cdb[0]);
+                woke_locked = 1;
                 attempt--;
                 continue;
             }

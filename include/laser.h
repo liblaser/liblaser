@@ -812,7 +812,10 @@ laser_status_t laser_media_poll(int token, laser_media_status_t *out);
  *
  * NOT RAISED when the drive, becoming ready again after a standby, answers
  * MEDIUM MAY HAVE CHANGED to the very command that woke it: that command is
- * retried, as before.
+ * retried, as before. Nor, while the tray is locked (laser_media_lock()), by
+ * a drive reporting a new medium at all - a NewMedia event, a MEDIUM MAY HAVE
+ * CHANGED - as some do on coming out of standby, for the disc they had: no
+ * disc goes in or out of a locked tray.
  *
  * @param token the registry token; a claim must be held.
  * @return the count; 0 for a token that is not registered.
@@ -825,6 +828,11 @@ unsigned laser_media_generation(int token);
  *
  * The lock is the drive's, not the token's: it outlives the registration,
  * and must be lifted by whoever set it, on every path.
+ *
+ * While it holds, a new medium the drive reports is taken for the disc
+ * already in - see laser_media_generation() - and laser_media_poll() reports
+ * no event for it. Until the lock is lifted, or the tray is seen open: a
+ * drive reset drops the lock, and a tray found open has none.
  */
 laser_status_t laser_media_lock(int token, int locked);
 

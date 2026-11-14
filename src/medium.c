@@ -401,8 +401,13 @@ static laser_status_t media_events(laser_entry_t *entry,
         /* The UNIT ATTENTION of a changed medium, consumed here: said to
          * the other consumers, whatever event follows. */
         if (asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
-            ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED)
-            laser_disc_changed_locked(entry);
+            ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) {
+            if (entry->tray_locked)
+                LOGI("token=%d: medium may have changed, tray locked - the "
+                     "drive waking, the same disc", entry->token);
+            else
+                laser_disc_changed_locked(entry);
+        }
     }
     pthread_mutex_unlock(&entry->io_lock);
 
@@ -519,11 +524,24 @@ static laser_status_t media_poll_entry(laser_entry_t *entry, int token,
      * with no disc in it - is otherwise nowhere in the log, and a disc put
      * in and never found reads as a tray never touched. With an event, the
      * event's own line says where the tray is. */
+    /* Open, it holds no lock, whatever was asked: see tray_locked. */
+    if (st == LASER_OK && out->tray_open)
+        entry->tray_locked = 0;
+
     if (st == LASER_OK && out->tray_open != entry->tray_open_seen) {
         entry->tray_open_seen = out->tray_open;
         if (out->event == LASER_MEDIA_NO_EVENT)
             LOGI("token=%d: tray %s", token,
                  out->tray_open ? "opened" : "closed");
+    }
+
+    /* A new medium with the tray locked is the one already in, reported
+     * again by a drive coming out of standby: see tray_locked. Not passed
+     * on - a poller would identify the disc again. */
+    if (st == LASER_OK && out->event == LASER_MEDIA_NEW && entry->tray_locked) {
+        LOGI("token=%d: new-medium event, tray locked - the drive waking, "
+             "the same disc", token);
+        out->event = LASER_MEDIA_NO_EVENT;
     }
 
     /* Another disc, or none: the blocks known not to read were the last
@@ -578,6 +596,14 @@ laser_status_t laser_media_lock(int token, int locked)
                                        NULL);
     LOGI("token=%d: tray %s -> %d", token, locked ? "lock" : "unlock",
          (int)st);
+
+    /* Recorded once the drive took it; an unlock refused leaves it unknown,
+     * which is taken for unlocked. */
+    laser_entry_t *entry = laser_pin(token);
+    if (entry != NULL) {
+        entry->tray_locked = locked && st == LASER_OK;
+        laser_unpin(entry);
+    }
     return st;
 }
 

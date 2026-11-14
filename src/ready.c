@@ -407,9 +407,11 @@ int laser_wait_until_ready(laser_entry_t *entry)
             medium_left = 1;
             laser_disc_changed_locked(entry);
         }
+        /* With the tray locked, the same disc: see tray_locked. */
         if (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
             asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
-            ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED) {
+            ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED &&
+            !entry->tray_locked) {
             medium_left = 0;
             laser_disc_changed_locked(entry);
         }
@@ -524,11 +526,14 @@ static void settle_entry(laser_entry_t *entry, int token)
 
     if (rc != 0 && rc != BOT_FAIL_NO_DEVICE) {
         const medium_sense_t medium = laser_medium_sense(sense_key, asc, ascq);
+        /* With the tray locked, a MEDIUM MAY HAVE CHANGED is the same
+         * disc: see tray_locked. */
         if (medium == MEDIUM_SENSE_ABSENT ||
             medium == MEDIUM_SENSE_TRAY_OPEN ||
             (sense_key == SCSI_SENSE_KEY_UNIT_ATTENTION &&
              asc == SCSI_ASC_MEDIUM_MAY_HAVE_CHANGED &&
-             ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED))
+             ascq == SCSI_ASCQ_MEDIUM_MAY_HAVE_CHANGED &&
+             !entry->tray_locked))
             laser_disc_changed_locked(entry);
     }
 
