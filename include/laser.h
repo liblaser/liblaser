@@ -334,7 +334,9 @@ typedef int (*laser_abort_cb_t)(void *opaque);
  *
  * A transaction already on the wire is not cut short: it completes, or times
  * out, first - which leaves the transport in a known state. So an abort takes
- * effect within one retry delay (500 ms) or one transaction.
+ * effect within one retry delay (500 ms) or one transaction. Except for a
+ * read the drive has not started answering, which may take it 30 seconds: it
+ * is given up within a second, and ends with LASER_ERR_CANCELLED.
  *
  * @p cb is called from the operation's thread, possibly often: it must be
  * cheap, and must not call into this library.

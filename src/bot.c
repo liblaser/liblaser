@@ -35,6 +35,7 @@
 
 #include "laser.h"
 #include "laser_internal.h"
+#include "scsi_internal.h"
 
 /* ============================================================================
  * BOT protocol constants (USB Mass Storage Class Bulk-Only Transport, rev 1.0)
@@ -103,6 +104,24 @@ _Static_assert(sizeof(bot_csw_t) == USB_BOT_CSW_SIZE,
  * Used while entry->slow_status is set, under io_lock. */
 #define SLOW_CSW_PHASE_TIMEOUT_MS  15000
 
+/* A READ's data phase. A drive retries a sector it reads with difficulty
+ * itself - seeking again, slowing down - for seconds before it answers, with
+ * the data or a medium error. Cut short by a Reset Recovery, those retries
+ * were started over by the next read, and never came to an end: a Blu-ray
+ * Linux plays through, which gives a command 30 seconds, read here as a run
+ * of unreadable blocks, 64 KiB every ten seconds. So a read gets Linux's
+ * time, and is not sent again once it has run out of it.
+ *
+ * Waited for in slices of READ_DATA_SLICE_MS while nothing has arrived,
+ * between which laser_must_stop() is asked: a player stopping, or a read
+ * ahead the reader has jumped away from, does not wait for the rest. A
+ * transfer waited for again is harmless while nothing came of it: the drive
+ * has not started sending. Once data flows, the rest is waited for at once.
+ *
+ * Used while entry->long_data is set, under io_lock. */
+#define READ_DATA_PHASE_TIMEOUT_MS  30000
+#define READ_DATA_SLICE_MS          1000
+
 /* Timeouts for PROBES - commands a working device answers at once, with or
  * without a medium (INQUIRY). Under the read timeouts, a device answering
  * nothing cost seconds per attempt to establish so, on every browse.
@@ -113,6 +132,43 @@ _Static_assert(sizeof(bot_csw_t) == USB_BOT_CSW_SIZE,
 #define PROBE_CSW_PHASE_TIMEOUT_MS    500
 
 static void bot_clear_stall(laser_entry_t *entry, unsigned char endpoint);
+
+/* A read's DATA-IN phase, as libusb_bulk_transfer() would do it with
+ * READ_DATA_PHASE_TIMEOUT_MS, but asking laser_must_stop() between slices
+ * while nothing has arrived: *stopped is then set, and
+ * LIBUSB_ERROR_TIMEOUT returned with nothing transferred. */
+static int bot_read_data(laser_entry_t *entry, unsigned char ep,
+                         unsigned char *data, int data_len, int *transferred,
+                         int *stopped)
+{
+    const int64_t started = laser_monotonic_ms_now();
+    int total = 0;
+    int ret;
+
+    for (;;) {
+        const int64_t left = READ_DATA_PHASE_TIMEOUT_MS -
+                             (laser_monotonic_ms_now() - started);
+        if (left <= 0) {
+            ret = LIBUSB_ERROR_TIMEOUT;
+            break;
+        }
+        const unsigned int wait = total > 0 || left < READ_DATA_SLICE_MS
+                                ? (unsigned int)left : READ_DATA_SLICE_MS;
+        int got = 0;
+        ret = libusb_bulk_transfer(entry->handle, ep, data + total,
+                                   data_len - total, &got, wait);
+        total += got;
+        if (ret != LIBUSB_ERROR_TIMEOUT || total == data_len) {
+            break;
+        }
+        if (total == 0 && laser_must_stop(entry)) {
+            *stopped = 1;
+            break;
+        }
+    }
+    *transferred = total;
+    return ret;
+}
 
 /* Draining the Bulk-In pipe after an overflow: reads of this size - a
  * multiple of every wMaxPacketSize (64, 512, 1024), so no packet can overflow
@@ -277,11 +333,29 @@ int laser_bot_send_locked(laser_entry_t *entry,
         return BOT_FAIL_NOT_SENT;
     }
 
+    entry->read_timed_out = 0;
+
     if (data_len > 0 && data) {
         unsigned char ep = data_in ? entry->ep_in : entry->ep_out;
+        const int long_read = entry->long_data && data_in &&
+                              !entry->probe_timeouts;
+        int stopped = 0;
 
-        ret = libusb_bulk_transfer(entry->handle, ep, data, data_len,
-                                   &transferred, data_timeout);
+        if (long_read) {
+            ret = bot_read_data(entry, ep, data, data_len, &transferred,
+                                &stopped);
+        } else {
+            ret = libusb_bulk_transfer(entry->handle, ep, data, data_len,
+                                       &transferred, data_timeout);
+        }
+        if (stopped) {
+            /* The drive has the command and may still answer it: only a
+             * Reset Recovery puts the pipes back in a known state. */
+            LOGI("token=%d: read given up on before any data came: "
+                 "stopping, performing Reset Recovery", entry->token);
+            laser_mass_storage_reset(entry);
+            return BOT_FAIL_CANCELLED;
+        }
         if (ret == LIBUSB_ERROR_PIPE) {
             /* A stalled data endpoint is how a device ends a data phase early
              * (BBB 6.7.2/6.7.3), with its CSW already queued on the Bulk-In
@@ -310,6 +384,9 @@ int laser_bot_send_locked(laser_entry_t *entry,
                 LOG_QUIRK(entry, "data phase timed out after %d/%d bytes: "
                                  "device still mid-transfer, performing Reset Recovery",
                           transferred, data_len);
+                if (long_read) {
+                    entry->read_timed_out = 1;
+                }
                 laser_mass_storage_reset(entry);
                 /* What arrived is what the device sent, and is in the
                  * buffer: for a read, the sectors before the one the

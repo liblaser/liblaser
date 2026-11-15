@@ -569,7 +569,29 @@ laser_status_t laser_scsi_cdb_read(int token,
     /* Whether the drive, stopped, has been told to start: once a command. */
     int start_sent = 0;
 
-    for (int attempt = 1; attempt <= LASER_MAX_RETRIES; attempt++) {
+    /* A read made ahead of these very sectors went unanswered for the whole
+     * of a read's time, with nothing asked of the drive since: it had all
+     * the time it takes, and would take as long again. Not for a read made
+     * ahead itself, which tries for what it is worth. */
+    int answered_already = 0;
+    if (is_read && max_resets >= LASER_READ_MAX_RESETS &&
+        entry->unanswered_count != 0 && entry->unanswered_long &&
+        read_lba >= entry->unanswered_lba &&
+        read_lba - entry->unanswered_lba < entry->unanswered_count) {
+        LOGW("token=%d: cdb 0x%02x%s - not answered in a read's whole time "
+             "when read ahead: these sectors, giving up on this read",
+             token, cdb[0], where);
+        entry->unanswered_count = 0;
+        answered_already = 1;
+        reason_logged = 1;
+        result = LASER_ERR_IO;
+        if (why != NULL) {
+            why->cause = LASER_FAILURE_NO_ANSWER;
+        }
+    }
+
+    for (int attempt = 1; !answered_already && attempt <= LASER_MAX_RETRIES;
+         attempt++) {
         attempts_made = attempt;
 
         /* Cancellation is honoured between attempts: a transfer already
@@ -590,17 +612,19 @@ laser_status_t laser_scsi_cdb_read(int token,
         clock_gettime(CLOCK_MONOTONIC, &xfer_started);
 
         entry->slow_status = cdb_status_is_slow(cdb, cdb_len);
+        entry->long_data = is_read;
         int rc = laser_bot_send_locked(entry, cdb, cdb_len, data, data_len,
                                          data_in, actual_len, &csw_status);
+        entry->long_data = 0;
         entry->slow_status = 0;
         if (rc == 0) {
             /* A success after retries is logged: otherwise a drive limping
              * through its budget on every command looks, in the log, like
              * one answering at once. */
             if (attempt > 1) {
-                LOGW("token=%d: cdb 0x%02x%s succeeded on attempt %d/%d - "
+                LOGW("token=%d: cdb 0x%02x%s succeeded on attempt %d - "
                      "earlier attempts failed and were retried",
-                     token, cdb[0], where, attempt, LASER_MAX_RETRIES);
+                     token, cdb[0], where, attempt);
             }
             /* Only a read following the previous one is a sample: a seek
              * costs what a slow link does, and a classification - the UDF
@@ -633,14 +657,34 @@ laser_status_t laser_scsi_cdb_read(int token,
             break;
         }
 
+        /* A read given up on in its data phase, asked to stop: nothing
+         * learnt of the sectors. */
+        if (rc == BOT_FAIL_CANCELLED) {
+            LOGI("token=%d: cancelled, abandoning cdb 0x%02x%s in its data "
+                 "phase", token, cdb[0], where);
+            result = LASER_ERR_CANCELLED;
+            break;
+        }
+
         uint8_t sense_key = 0xff, asc = 0, ascq = 0;
         if (rc == BOT_FAIL_PHASE_ERROR) {
             /* The device was just reset: there is no completed command left
              * for REQUEST SENSE to explain. The attempt still counts. */
+            /* The budget this attempt counts against: a read's resets, at
+             * most one after a data phase that had all of a read's time. */
+            const int budget = !is_read ? LASER_MAX_RETRIES
+                             : entry->read_timed_out ? 1 : max_resets;
             LOGW("token=%d: cdb 0x%02x%s ended in a Reset Recovery (attempt "
-                 "%d/%d)", token, cdb[0], where, attempt, LASER_MAX_RETRIES);
+                 "%d/%d)", token, cdb[0], where,
+                 is_read ? resets_in_a_row + 1 : attempt, budget);
             if (is_read) {
                 resets_in_a_row++;
+                /* The drive had all the time it takes: not asked again -
+                 * but for a drive saying it is spinning up, waited for
+                 * below. */
+                if (entry->read_timed_out && resets_in_a_row < max_resets) {
+                    resets_in_a_row = max_resets;
+                }
                 unanswered = 1;
                 if (data_in && actual_len != NULL && *actual_len > received &&
                     *actual_len < data_len) {
@@ -657,6 +701,7 @@ laser_status_t laser_scsi_cdb_read(int token,
                          token, cdb[0], where);
                     entry->unanswered_lba = read_lba;
                     entry->unanswered_count = read_count;
+                    entry->unanswered_long = entry->read_timed_out;
                     reason_logged = 1;
                     result = LASER_ERR_IO;
                     break;

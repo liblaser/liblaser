@@ -311,6 +311,18 @@ typedef struct {
      * timeout. Set and cleared around the command, under io_lock. */
     int slow_status;
 
+    /** Nonzero while a read - READ(10), READ CD - is in flight: its data
+     * phase gets READ_DATA_PHASE_TIMEOUT_MS, waited for in slices between
+     * which the abort check is asked (see bot.c). Set and cleared around the
+     * command, under io_lock. */
+    int long_data;
+
+    /** Set by laser_bot_send_locked() when such a read's data phase ran out
+     * of that time: the drive had all a read is given, and the read is not
+     * sent again. Cleared at the start of every transaction, under
+     * io_lock. */
+    int read_timed_out;
+
     /* Logical Unit to address in every CBW. Almost always 0, but a combo
      * enclosure may put its card reader there and the optical drive on
      * another unit. Chosen at registration by laser_probe_lun(). */
@@ -393,6 +405,11 @@ typedef struct {
      * A count of 0: none. Under io_lock. */
     uint32_t        unanswered_lba;
     uint32_t        unanswered_count;
+    /* Whether that read was given the whole of READ_DATA_PHASE_TIMEOUT_MS
+     * (laser_entry_t::read_timed_out): the read of those sectors that
+     * follows then fails at once, see laser_scsi_cdb_read(). Under
+     * io_lock. */
+    int             unanswered_long;
 
     /* The read commands sent since a consumer last came or went, for the
      * log of the next one to go: see laser_log_reads(). Counted without a
@@ -656,6 +673,12 @@ int laser_probe_lun(laser_entry_t *entry);
  * further command would cost a full set of USB timeouts. */
 #define BOT_FAIL_NO_DEVICE   (-4)
 
+/** A read's data phase given up on while the drive had sent nothing, because
+ * laser_must_stop() said so - the token cancelled, or the calling thread's
+ * abort check: the Reset Recovery BBB requires has been performed. Says
+ * nothing of the sectors. */
+#define BOT_FAIL_CANCELLED   (-5)
+
 /**
  * Perform exactly one Bulk-Only transaction: CBW, data phase in either
  * direction, CSW - and, where BBB requires it, the Reset Recovery that must
@@ -668,6 +691,7 @@ int laser_probe_lun(laser_entry_t *entry);
  *   BOT_FAIL_NOT_SENT     the drive never executed it; replay is free
  *   BOT_FAIL_PHASE_ERROR  host and device disagreed; recovery already done
  *   BOT_FAIL_NO_DEVICE    the device is gone; no budget can help
+ *   BOT_FAIL_CANCELLED    a read given up on, asked to stop; recovery done
  *   -1                    anything else: the CBW went out, so the drive HAS
  *                         received the command and may have executed it, in
  *                         full or in part, even though we failed to read the

@@ -73,14 +73,16 @@
 #define LASER_READ_MAX_MEDIUM_ERRORS 2
 
 /* A read the drive did not answer at all, twice in a row - each time ending
- * in a Reset Recovery, some five seconds - is not retried further: a drive
- * stuck on a sector, as some are on a scrambled one read without CSS
- * authentication, does no better the next four times, and the full budget
- * turned one sector into half a minute.
+ * in a Reset Recovery - is not retried further: a drive stuck on a sector,
+ * as some are on a scrambled one read without CSS authentication, does no
+ * better the next four times, and the full budget turned one sector into
+ * half a minute.
  *
  * Most often the second attempt is not made either: the drive is asked
  * whether it is ready after the first, see unit_ready_after_reset_locked()
- * in scsi.c. A read made ahead gives up at the first, unasked. */
+ * in scsi.c. Nor ever after a data phase that had all of a read's time, 30
+ * seconds (READ_DATA_PHASE_TIMEOUT_MS in bot.c), but for a drive spinning
+ * up. A read made ahead gives up at the first, unasked. */
 #define LASER_READ_MAX_RESETS   2
 
 /* Under ILLEGAL REQUEST, read after a refused START STOP UNIT: "no such
