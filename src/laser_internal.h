@@ -399,6 +399,10 @@ typedef struct {
      * say so once: see request_sense_locked(). Under io_lock. */
     int             deferred_state_noted;
 
+    /* Set once a failed read's own medium error has come as deferred sense,
+     * likewise: see laser_scsi_cdb(). Under io_lock. */
+    int             deferred_medium_noted;
+
     /* The last read given up unanswered with nothing asked of the drive
      * since - a read made ahead: the sectors a deferred MEDIUM ERROR
      * answered to the next read of them is about, see laser_scsi_cdb_read().

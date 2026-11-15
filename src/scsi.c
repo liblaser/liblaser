@@ -803,6 +803,35 @@ laser_status_t laser_scsi_cdb_read(int token,
                 }
                 break;
             }
+
+            /* A read the drive failed, after its own retries, explaining it
+             * with a deferred MEDIUM ERROR: some drives report this way the
+             * error of the command that just failed - each attempt as long,
+             * the same sense each time. Commands go one at a time over the
+             * transport, the one before this read completed: the failure
+             * is this read's, a medium error, rather than a reason unknown
+             * that the whole LASER_MAX_RETRIES budget is spent on - six
+             * quarters of a minute a read, on a DVD whose IFO's backup
+             * copy does not read. Not when it names a sector outside the
+             * read, as above. */
+            if (is_read && sense_key == 0xff &&
+                deferred.sense_key == SCSI_SENSE_KEY_MEDIUM_ERROR &&
+                !(deferred.lba_valid && (deferred.lba < read_lba ||
+                                         deferred.lba - read_lba >= read_count))) {
+                if (!entry->deferred_medium_noted) {
+                    entry->deferred_medium_noted = 1;
+                    LOG_QUIRK(entry, "a failed read's medium error (%02x/%02x/%02x) "
+                              "reported as deferred sense: read as this "
+                              "read's (further occurrences not logged)",
+                              deferred.sense_key, deferred.asc, deferred.ascq);
+                }
+                sense_key = deferred.sense_key;
+                asc = deferred.asc;
+                ascq = deferred.ascq;
+                last_sense_key = sense_key;
+                last_asc = asc;
+                last_ascq = ascq;
+            }
         }
 
         if (rc != BOT_FAIL_PHASE_ERROR)

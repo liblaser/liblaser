@@ -63,14 +63,15 @@
  * written. As final as a refusal, and reported as one. */
 #define SCSI_SENSE_KEY_BLANK_CHECK      0x08
 
-/* A read the drive answered with a medium error is tried twice, not
- * LASER_MAX_RETRIES times: the drive has already retried the sector itself,
- * and a disc it reads poorly - read fine by another drive - fails one
- * attempt in several. A JMicron bridge stalls three seconds on each, and
- * the full budget made a few such sectors outlast classification's minute.
- * read_chunked() tries the smaller reads it narrows such a failure down
- * with once each. */
-#define LASER_READ_MAX_MEDIUM_ERRORS 2
+/* A read the drive answered with a medium error is not tried again: the
+ * drive has already retried the sector itself, for seconds - fourteen a
+ * read on a drive seen, three on a JMicron bridge - and the same command
+ * again mostly repeats that work. read_chunked() narrows the failure down
+ * with smaller reads instead, tried once each: the first of them reads the
+ * start of the same sectors again, which is the second attempt a disc
+ * read poorly - failing one attempt in several - may need, and finds where
+ * the sectors that do not read start. */
+#define LASER_READ_MAX_MEDIUM_ERRORS 1
 
 /* A read the drive did not answer at all, twice in a row - each time ending
  * in a Reset Recovery - is not retried further: a drive stuck on a sector,
@@ -230,11 +231,10 @@ typedef struct {
 } laser_failure_t;
 
 /* laser_scsi_cdb(), giving up on a read after @p max_medium_errors attempts
- * the drive answered with a medium error rather than
- * LASER_READ_MAX_MEDIUM_ERRORS - 1 for once - and after @p max_resets
- * attempts it did not answer at all rather than LASER_READ_MAX_RESETS - 1
- * for a read made ahead - and saying why it failed through @p why, if not
- * NULL. */
+ * the drive answered with a medium error - LASER_READ_MAX_MEDIUM_ERRORS -
+ * and after @p max_resets attempts it did not answer at all rather than
+ * LASER_READ_MAX_RESETS - 1 for a read made ahead - and saying why it
+ * failed through @p why, if not NULL. */
 laser_status_t laser_scsi_cdb_read(int token,
                                    const uint8_t *cdb, int cdb_len,
                                    uint8_t *data, int data_len,
