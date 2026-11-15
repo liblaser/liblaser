@@ -173,6 +173,14 @@ typedef struct {
      * its oldest range for a new one, it only grows. Under learnt_lock. */
     unsigned unreadable_total;
 
+    /* The chunk a read made ahead last failed on with a medium error: the
+     * reader's read of it starts at the smaller size a medium error is
+     * narrowed down with, rather than try the whole of it again. A count of
+     * 0: none. Taken by that read, forgotten when the disc changes. See
+     * read_chunked() in read.c. Under learnt_lock. */
+    uint32_t ahead_medium_lba;
+    uint32_t ahead_medium_count;
+
     /* Single blocks a READ(10) was refused on - a positional status, see
      * laser_status_is_positional() - with the status, and how many times:
      * 0 hits for an empty slot. A read reaching one stops short of it; one

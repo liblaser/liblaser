@@ -559,6 +559,9 @@ laser_status_t laser_scsi_cdb_read(int token,
                                       &read_lba, &read_count);
     int resets_in_a_row = 0;
     int medium_errors = 0;
+    /* A read made ahead (see below): given up on when the reader jumps
+     * elsewhere, which is routine and not logged. */
+    const int ahead = is_read && max_resets < LASER_READ_MAX_RESETS;
 
     /* Whether an attempt of this read went unanswered, and the most bytes
      * one had received by then: see laser_failure_t::received. An attempt
@@ -599,8 +602,9 @@ laser_status_t laser_scsi_cdb_read(int token,
          * follows. So is an abort, the "becoming ready" wait included: each
          * of its rounds is an attempt. */
         if (laser_must_stop(entry)) {
-            LOGI("token=%d: cancelled, abandoning cdb 0x%02x after %d "
-                 "attempt(s)", token, cdb[0], attempt - 1);
+            if (!ahead)
+                LOGI("token=%d: cancelled, abandoning cdb 0x%02x after %d "
+                     "attempt(s)", token, cdb[0], attempt - 1);
             result = LASER_ERR_CANCELLED;
             break;
         }
@@ -660,8 +664,9 @@ laser_status_t laser_scsi_cdb_read(int token,
         /* A read given up on in its data phase, asked to stop: nothing
          * learnt of the sectors. */
         if (rc == BOT_FAIL_CANCELLED) {
-            LOGI("token=%d: cancelled, abandoning cdb 0x%02x%s in its data "
-                 "phase", token, cdb[0], where);
+            if (!ahead)
+                LOGI("token=%d: cancelled, abandoning cdb 0x%02x%s in its "
+                     "data phase, Reset Recovery done", token, cdb[0], where);
             result = LASER_ERR_CANCELLED;
             break;
         }

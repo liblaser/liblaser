@@ -204,6 +204,31 @@ static void remember_unreadable(laser_entry_t *entry, int token, uint32_t lba,
          "disc changes", token, lba, count);
 }
 
+/* A read made ahead failed with a medium error on the @p count blocks at
+ * @p lba: see laser_entry_t::ahead_medium_lba. */
+static void note_ahead_medium(laser_entry_t *entry, uint32_t lba, int count)
+{
+    pthread_mutex_lock(&entry->learnt_lock);
+    entry->ahead_medium_lba = lba;
+    entry->ahead_medium_count = (uint32_t)count;
+    pthread_mutex_unlock(&entry->learnt_lock);
+}
+
+/* Whether @p lba is in the chunk a read made ahead last failed on with a
+ * medium error; if so, forgotten: one read starts smaller for it. */
+static int take_ahead_medium(laser_entry_t *entry, uint32_t lba)
+{
+    pthread_mutex_lock(&entry->learnt_lock);
+    const int hit = entry->ahead_medium_count != 0 &&
+                    lba >= entry->ahead_medium_lba &&
+                    lba - entry->ahead_medium_lba < entry->ahead_medium_count;
+    if (hit) {
+        entry->ahead_medium_count = 0;
+    }
+    pthread_mutex_unlock(&entry->learnt_lock);
+    return hit;
+}
+
 /* A READ(10) of the single block @p lba was refused with @p status. Logged
  * once per block. */
 static void remember_refusal(laser_entry_t *entry, int token, uint32_t lba,
@@ -288,6 +313,7 @@ void laser_disc_changed_locked(laser_entry_t *entry)
     memset(entry->unreadable, 0, sizeof(entry->unreadable));
     entry->unreadable_next = 0;
     entry->unreadable_total = 0;
+    entry->ahead_medium_count = 0;
     memset(entry->refused, 0, sizeof(entry->refused));
     pthread_mutex_unlock(&entry->learnt_lock);
     entry->unanswered_count = 0;
@@ -521,6 +547,20 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
             }
         }
 
+        /* Blocks a read made ahead has just failed on with a medium error:
+         * the drive spent its own retries on them then, and would again.
+         * Narrowed down at once, as if this read had failed the same way -
+         * the first smaller read is their second attempt. */
+        if (!ahead && entry != NULL && medium_since == 0 &&
+            take_ahead_medium(entry, at)) {
+            medium_since = laser_monotonic_ms_now();
+            medium_split = 1;
+            if (chunk > LASER_MEDIUM_NARROW_MIN_BLOCKS) {
+                split_cap = (chunk / 2) * block_size;
+                continue;
+            }
+        }
+
         uint8_t cdb[16];
         memset(cdb, 0, sizeof(cdb));
         build_cdb(cdb, at, chunk, ctx);
@@ -582,7 +622,12 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
             if (entry == NULL || ahead) {
                 /* Read ahead: one attempt was the whole of it. Whoever
                  * wants these blocks reads them with the patience they are
-                 * worth. And nowhere to record without an entry. */
+                 * worth - narrowed down at once after a medium error. And
+                 * nowhere to record without an entry. */
+                if (entry != NULL && st == LASER_ERR_IO &&
+                    why.cause == LASER_FAILURE_MEDIUM) {
+                    note_ahead_medium(entry, at, chunk);
+                }
                 blocks_done += sent;
             } else if (refusals && laser_status_is_positional(st)) {
                 /* A refusal fails the whole command: narrowed down to the

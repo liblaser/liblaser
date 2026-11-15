@@ -350,9 +350,9 @@ int laser_bot_send_locked(laser_entry_t *entry,
         }
         if (stopped) {
             /* The drive has the command and may still answer it: only a
-             * Reset Recovery puts the pipes back in a known state. */
-            LOGI("token=%d: read given up on before any data came: "
-                 "stopping, performing Reset Recovery", entry->token);
+             * Reset Recovery puts the pipes back in a known state. Logged
+             * by the command layer, which knows whether anyone waited for
+             * the read. */
             laser_mass_storage_reset(entry);
             return BOT_FAIL_CANCELLED;
         }
