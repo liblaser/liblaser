@@ -1,0 +1,109 @@
+# liblaser's continuous integration: on every push and pull request,
+#
+#   tests    - the tests, against simulated devices (no drive, no USB), in a
+#              build for the Linux runner itself
+#   android  - the library cross-built with the NDK for each Android ABI:
+#              a build check only, nothing runs
+#
+# The vendored libusb and libudfread are submodules: checked out with them.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install meson and ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+
+      - name: Configure
+        run: meson setup build -Dtests=true
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Keep the test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog
+          path: build/meson-logs/testlog.txt
+
+  android:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+            cpu_family: aarch64
+            cpu: aarch64
+          - abi: armeabi-v7a
+            target: armv7a-linux-androideabi
+            cpu_family: arm
+            cpu: armv7a
+          - abi: x86_64
+            target: x86_64-linux-android
+            cpu_family: x86_64
+            cpu: x86_64
+          - abi: x86
+            target: i686-linux-android
+            cpu_family: x86
+            cpu: i686
+    env:
+      # The lowest the runner's NDK can target, for every ABI.
+      ANDROID_API: 21
+    name: android (${{ matrix.abi }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install meson and ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+
+      # The NDK the runner image comes with; confine.py is told its tools
+      # (OBJCOPY, NM, AR), so that it does not pick the runner's own.
+      - name: Write the cross file
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "NDK: $NDK"
+          cat > android.ini <<EOF
+          [binaries]
+          c = '$BIN/${{ matrix.target }}${ANDROID_API}-clang'
+          ar = '$BIN/llvm-ar'
+          strip = '$BIN/llvm-strip'
+
+          [host_machine]
+          system = 'android'
+          cpu_family = '${{ matrix.cpu_family }}'
+          cpu = '${{ matrix.cpu }}'
+          endian = 'little'
+          EOF
+          cat android.ini
+          echo "OBJCOPY=$BIN/llvm-objcopy" >> "$GITHUB_ENV"
+          echo "NM=$BIN/llvm-nm" >> "$GITHUB_ENV"
+          echo "AR=$BIN/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: meson setup build --cross-file android.ini
+
+      - name: Build
+        run: meson compile -C build

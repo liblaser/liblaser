@@ -118,9 +118,16 @@ _Static_assert(sizeof(bot_csw_t) == USB_BOT_CSW_SIZE,
  * transfer waited for again is harmless while nothing came of it: the drive
  * has not started sending. Once data flows, the rest is waited for at once.
  *
- * Used while entry->long_data is set, under io_lock. */
+ * Used while entry->long_data is set, under io_lock.
+ *
+ * Overridable, for the tests: a drive that does not answer would otherwise
+ * cost them 30 real seconds each time. */
+#ifndef READ_DATA_PHASE_TIMEOUT_MS
 #define READ_DATA_PHASE_TIMEOUT_MS  30000
+#endif
+#ifndef READ_DATA_SLICE_MS
 #define READ_DATA_SLICE_MS          1000
+#endif
 
 /* Timeouts for PROBES - commands a working device answers at once, with or
  * without a medium (INQUIRY). Under the read timeouts, a device answering

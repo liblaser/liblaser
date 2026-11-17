@@ -14,6 +14,11 @@
 /* The waits between two attempts are not what is tested. */
 #define usleep(us) ((void)(us))
 
+/* Nor is how long a read waits for a drive that does not answer: a tenth of
+ * a second, not the 30 a drive is given. */
+#define READ_DATA_PHASE_TIMEOUT_MS  100
+#define READ_DATA_SLICE_MS          10
+
 #include "../src/bot.c"
 #include "../src/scsi.c"
 #include "../src/medium.c"
@@ -251,7 +256,7 @@ static void begin(const char *name, void (*s)(const uint8_t *, int))
 }
 
 /* One block at LBA 100, read as a reader does: given up after two medium
- * errors, or two attempts not answered. */
+ * errors, or one attempt not answered. */
 static uint8_t block[2048];
 
 static laser_status_t read_block(laser_failure_t *why, int max_resets)
@@ -512,45 +517,25 @@ static void unanswered_reads(void)
     CHECK(read_block(&why, 2) == LASER_OK);
     CHECK(sent[OP_READ_10] == 2);
 
-    begin("not answered, then a deferred MEDIUM ERROR: the read's answer",
-          retries_then_deferred_sense);
+    begin("a read not answered by a drive still trying the sector: not "
+          "sent again", retries_then_deferred_sense);
     deferred_key = 3, deferred_lba_valid = 0;
     CHECK(read_block(&why, 2) == LASER_ERR_IO);
-    CHECK(sent[OP_READ_10] == 2);
+    CHECK(sent[OP_READ_10] == 1);
     CHECK(why.cause == LASER_FAILURE_NO_ANSWER);
-    CHECK(why.sense_key == 3);
     CHECK(why.received == 0);
-
-    begin("the same, naming the block read", retries_then_deferred_sense);
-    deferred_lba_valid = 1, deferred_lba = 100;
-    CHECK(read_block(&why, 2) == LASER_ERR_IO);
-    CHECK(sent[OP_READ_10] == 2);
-    CHECK(why.cause == LASER_FAILURE_NO_ANSWER);
-
-    begin("the same, naming another block: another read's, this one is "
-          "sent again", retries_then_deferred_sense);
-    deferred_lba = 5000;
-    CHECK(read_block(&why, 2) == LASER_OK);
-    CHECK(sent[OP_READ_10] == 3);
-
-    begin("not answered, then a deferred HARDWARE ERROR: sent again",
-          retries_then_deferred_sense);
-    deferred_key = 4, deferred_lba_valid = 0;
-    CHECK(read_block(&why, 2) == LASER_OK);
-    CHECK(sent[OP_READ_10] == 3);
 
     begin("a read-ahead not answered: one attempt, nobody blamed",
           retries_then_deferred_sense);
-    deferred_key = 3;
     CHECK(read_block(&why, 1) == LASER_ERR_IO);
     CHECK(sent[OP_READ_10] == 1);
     CHECK(why.cause == LASER_FAILURE_OTHER);
 
     /* No begin(): the device goes on from the read-ahead above. */
-    check_case("then the same blocks read: the deferred MEDIUM ERROR is "
-               "the answer at once");
+    check_case("then the same block read: given up at once, the read-ahead "
+               "having had a read's whole time");
     CHECK(read_block(&why, 2) == LASER_ERR_IO);
-    CHECK(sent[OP_READ_10] == 2);
+    CHECK(sent[OP_READ_10] == 1);
     CHECK(why.cause == LASER_FAILURE_NO_ANSWER);
 
     begin("a read the drive stops answering after 1024 bytes",
