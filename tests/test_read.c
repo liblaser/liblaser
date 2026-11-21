@@ -21,8 +21,13 @@ static enum {
     BAD_MEDIUM,     /* MEDIUM ERROR */
     BAD_NO_ANSWER,  /* not answered, the drive otherwise ready */
     BAD_OTHER,      /* an I/O error that says nothing of the blocks */
+    BAD_LANDING,    /* MEDIUM ERROR, unless the command before ended where
+                     * this one starts: a weak zone read in order only */
 } bad_mode;
 static uint32_t bad_lo, bad_hi;
+
+/* Where the last command ended, failed or not: see BAD_LANDING. */
+static uint32_t last_end = UINT32_MAX;
 
 /* A read not answered has sent the blocks before the bad one. */
 static int sends_partial;
@@ -61,6 +66,13 @@ int64_t laser_monotonic_ms_now(void)
     return 1000;
 }
 
+/* Nobody stops a read here. */
+int laser_must_stop(const laser_entry_t *e)
+{
+    (void) e;
+    return 0;
+}
+
 /* No case here has the drive refuse a read. */
 int laser_status_is_positional(int status)
 {
@@ -82,6 +94,10 @@ laser_status_t laser_scsi_cdb_read(int token, const uint8_t *cdb, int cdb_len,
 
     commands++;
 
+    /* The run-up's reads ask for no explanation. */
+    laser_failure_t ignored;
+    if (why == NULL)
+        why = &ignored;
     why->cause = LASER_FAILURE_OTHER;
     why->sense_key = 0xff;
     why->asc = why->ascq = 0;
@@ -97,8 +113,15 @@ laser_status_t laser_scsi_cdb_read(int token, const uint8_t *cdb, int cdb_len,
     const uint32_t lba = (uint32_t)cdb[2] << 24 | (uint32_t)cdb[3] << 16 |
                          (uint32_t)cdb[4] << 8 | cdb[5];
     const uint32_t count = (uint32_t)cdb[7] << 8 | cdb[8];
+    const uint32_t previous_end = last_end;
+    last_end = lba + count;
 
-    if (bad_mode != BAD_NONE && lba < bad_hi && lba + count > bad_lo) {
+    if (bad_mode == BAD_LANDING) {
+        if (lba < bad_hi && lba + count > bad_lo && lba != previous_end) {
+            why->cause = LASER_FAILURE_MEDIUM;
+            return LASER_ERR_IO;
+        }
+    } else if (bad_mode != BAD_NONE && lba < bad_hi && lba + count > bad_lo) {
         if (bad_mode == BAD_MEDIUM)
             why->cause = LASER_FAILURE_MEDIUM;
         if (bad_mode == BAD_NO_ANSWER)
@@ -139,6 +162,7 @@ static void fresh_disc(void)
     bridge_limit = 0;
     transient_failures = 0;
     commands = 0;
+    last_end = UINT32_MAX;
 }
 
 static uint8_t buffer[256 * 2048];
@@ -347,6 +371,65 @@ static void blocks_sent_before_a_stall_are_returned(void)
     CHECK(recorded_ranges() == 0);
 }
 
+static void weak_zone_is_read_after_a_run_up(void)
+{
+    check_case("a weak zone the drive reads in order only, landed in");
+    fresh_disc();
+    bad_mode = BAD_LANDING;
+    bad_lo = 3000;
+    bad_hi = 3100;
+
+    /* Landing at 3010 fails; read up to it from 962, 2048 blocks in 64
+     * commands, the last of which, over 2978-3010, reads in order; then
+     * 3010 again, in order too. Nothing recorded. */
+    CHECK(laser_read_blocks(1, 3010, 32, buffer) == 32);
+    CHECK(commands == 1 + 64 + 1);
+    CHECK(recorded_ranges() == 0);
+
+    /* Near the start of the disc, the run-up starts at block 0. */
+    fresh_disc();
+    bad_mode = BAD_LANDING;
+    bad_lo = 100;
+    bad_hi = 200;
+    CHECK(laser_read_blocks(1, 128, 32, buffer) == 32);
+    CHECK(commands == 1 + 4 + 1);
+    CHECK(recorded_ranges() == 0);
+}
+
+static void run_up_is_made_once_a_read(void)
+{
+    check_case("an unreadable sector, a run-up not curing it");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 3000;
+    bad_hi = 3004;
+
+    /* The failure, the run-up's 64 commands, the chunk again; then the
+     * narrowing, 16, 8 and 4 blocks - no second run-up. */
+    CHECK(laser_read_blocks(1, 3000, 32, buffer) == LASER_ERR_IO);
+    CHECK(commands == 1 + 64 + 1 + 3);
+    CHECK(laser_unreadable_blocks(1, 3000, 32) == 4);
+
+    /* Recorded: asked for again, answered without the drive. */
+    commands = 0;
+    CHECK(laser_read_blocks(1, 3000, 32, buffer) == LASER_ERR_IO);
+    CHECK(commands == 0);
+}
+
+static void read_ahead_makes_no_run_up(void)
+{
+    check_case("a read-ahead landing in a weak zone");
+    fresh_disc();
+    bad_mode = BAD_LANDING;
+    bad_lo = 3000;
+    bad_hi = 3100;
+
+    /* Tried once, given up: the reader's own read makes the run-up. */
+    CHECK(laser_read_blocks_ahead(1, 3010, 32, buffer) == LASER_ERR_IO);
+    CHECK(commands == 1);
+    CHECK(recorded_ranges() == 0);
+}
+
 int main(void)
 {
     pthread_mutex_init(&entry.io_lock, NULL);
@@ -362,6 +445,9 @@ int main(void)
     transfer_size_is_lowered_on_a_repeated_failure();
     transfer_size_survives_a_passing_failure();
     blocks_sent_before_a_stall_are_returned();
+    weak_zone_is_read_after_a_run_up();
+    run_up_is_made_once_a_read();
+    read_ahead_makes_no_run_up();
 
     return check_result();
 }

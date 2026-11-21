@@ -27,6 +27,7 @@
  * laser_refused_for_good()), kept until the disc changes.
  *****************************************************************************/
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "laser.h"
@@ -44,6 +45,16 @@
  * minute of halving. */
 #define LASER_MEDIUM_NARROW_MIN_BLOCKS 4
 #define LASER_MEDIUM_NARROW_MAX_MS     5000
+
+/* A medium error is read again once after a run-up - see read_chunked() -
+ * from this many blocks before the chunk: 4 MiB, past a weak zone of a disc
+ * the drive fails to land in, a dual-layer BD's 2 MiB seen, for half a
+ * second of reading in order where the disc reads. For this long at most,
+ * and up to this many failed reads of the run-up: on a disc that does not
+ * read there either, landing in it again is what it costs. */
+#define LASER_RUN_UP_BLOCKS       2048
+#define LASER_RUN_UP_MAX_MS       8000
+#define LASER_RUN_UP_MAX_FAILURES 3
 
 /* Build the CDB for one chunk - the only thing the two public helpers below
  * do differently. */
@@ -227,6 +238,80 @@ static int take_ahead_medium(laser_entry_t *entry, uint32_t lba)
     }
     pthread_mutex_unlock(&entry->learnt_lock);
     return hit;
+}
+
+/* Reads the LASER_RUN_UP_BLOCKS blocks before @p lba, in order, into a
+ * buffer of its own and for nothing else: the drive then comes to @p lba as
+ * it does reading a film, rather than landing on it after a jump - which on a
+ * weak zone of a disc it may fail to do, though it reads the same sectors in
+ * order. Each read tried once, nothing recorded: what the run-up's reads
+ * meet is not asked of the disc.
+ *
+ * Returns 0, or LASER_ERR_MEDIA_GONE, LASER_ERR_NO_DEVICE or
+ * LASER_ERR_CANCELLED, which end the read. */
+static int run_up_to(laser_entry_t *entry, int token, uint32_t lba,
+                     int block_size, int cdb_len, build_read_cdb_fn build_cdb,
+                     const void *ctx)
+{
+    const uint32_t from = lba > LASER_RUN_UP_BLOCKS
+                        ? lba - LASER_RUN_UP_BLOCKS : 0;
+    if (from == lba) {
+        return 0;
+    }
+
+    int per = entry->max_transfer_bytes / block_size;
+    if (per < 1) {
+        per = 1;
+    }
+    uint8_t *scratch = malloc((size_t)per * block_size);
+    if (scratch == NULL) {
+        return 0;
+    }
+
+    const int64_t started = laser_monotonic_ms_now();
+    int status = 0;
+    int failed = 0;
+    uint32_t at = from;
+    while (at < lba) {
+        if (laser_must_stop(entry)) {
+            status = (int)LASER_ERR_CANCELLED;
+            break;
+        }
+        if (failed >= LASER_RUN_UP_MAX_FAILURES ||
+            laser_monotonic_ms_now() - started >= LASER_RUN_UP_MAX_MS) {
+            break;
+        }
+
+        int n = per;
+        if ((uint32_t)n > lba - at) {
+            n = (int)(lba - at);
+        }
+        uint8_t cdb[16];
+        memset(cdb, 0, sizeof(cdb));
+        build_cdb(cdb, at, n, ctx);
+        int actual_len = 0;
+        const laser_status_t st =
+            laser_scsi_cdb_read(token, cdb, cdb_len, scratch, n * block_size,
+                                /* data_in = */ 1, &actual_len, 1, 1, NULL);
+        if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
+            st == LASER_ERR_CANCELLED) {
+            status = (int)st;
+            break;
+        }
+        if (st != LASER_OK) {
+            failed++;
+        }
+        at += (uint32_t)n;
+    }
+    free(scratch);
+
+    if (status == 0) {
+        LOGI("token=%d: LBA %u read up to from LBA %u (%u blocks of %u, %d "
+             "read(s) failed, %d ms), reading it again",
+             token, lba, from, at - from, lba - from, failed,
+             (int)(laser_monotonic_ms_now() - started));
+    }
+    return status;
 }
 
 /* A READ(10) of the single block @p lba was refused with @p status. Logged
@@ -466,6 +551,18 @@ int laser_refused_for_good(int token, uint32_t lba)
  * most, and never after a drive that did not answer at all: a protection's
  * unreadable sectors are those, each costing the drive a timeout.
  *
+ * A MEDIUM ERROR IS READ AGAIN ONCE, AFTER A RUN-UP. Before it is narrowed
+ * down, the chunk that failed is read again, once a read, after the
+ * LASER_RUN_UP_BLOCKS blocks before it have been read in order (run_up_to()).
+ * A drive may read a weak zone of a disc in order and fail to land in it
+ * after a jump - a menu clip at the end of a dual-layer BD's second layer
+ * did not read in playback, and read in a desktop's dd, reading up to it -
+ * and a player jumps: to a clip's start, or back to it, or to the next
+ * window after a pause. A sector that does not read fails the second time
+ * too, and is narrowed down and recorded as before, for the cost of one
+ * more read and the run-up. Only for READ(10), a DVD's or a BD's blocks: a
+ * CD's tracks are read in order.
+ *
  * @param entry      the token's entry, pinned by the caller, for the
  *                   transfer cap and the blocks known not to read; NULL for
  *                   a token not registered, which costs only those:
@@ -517,6 +614,11 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
      * whether one has been split since: the smaller reads are tried once. */
     int64_t medium_since = 0;
     int medium_split = 0;
+
+    /* Whether the run-up has been made, once a read; and whether the chunk
+     * read now is the one read again after it. */
+    int run_up_done = 0;
+    int run_up_retry = 0;
 
     while (blocks_done < num_blocks) {
         /* Re-read every time round: another thread on the same drive may
@@ -639,11 +741,32 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                     remember_refusal(entry, token, at, (int)st);
                 }
             } else if (st == LASER_ERR_IO &&
+                       why.cause == LASER_FAILURE_MEDIUM && refusals &&
+                       !run_up_done) {
+                /* Maybe a weak zone the drive failed to land in: read up to
+                 * the chunk in order, then the chunk again - see "a medium
+                 * error is read again once, after a run-up" above. The
+                 * narrowing below starts from its failure. */
+                run_up_done = 1;
+                const int r = run_up_to(entry, token, at, block_size, cdb_len,
+                                        build_cdb, ctx);
+                if (r < 0) {
+                    return r;
+                }
+                run_up_retry = 1;
+                medium_since = 0;
+                continue;
+            } else if (st == LASER_ERR_IO &&
                        why.cause == LASER_FAILURE_MEDIUM) {
                 /* The drive reached the blocks and could not read them:
                  * narrowed down so that those before the bad ones are
                  * returned - see "a medium error is narrowed down" above.
                  * The bridge is not to blame: it carried the answer. */
+                if (run_up_retry) {
+                    LOGI("token=%d: LBA %u x %d unreadable after a run-up "
+                         "too", token, at, chunk);
+                    run_up_retry = 0;
+                }
                 const int64_t now = laser_monotonic_ms_now();
                 if (medium_since == 0) {
                     medium_since = now;
@@ -716,6 +839,11 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
 
         if (entry != NULL) {
             raise_largest_ok(entry, chunk * block_size);
+        }
+        if (run_up_retry) {
+            LOGI("token=%d: LBA %u x %d read after a run-up", token, at,
+                 chunk);
+            run_up_retry = 0;
         }
         blocks_done += chunk;
 
