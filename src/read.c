@@ -614,6 +614,12 @@ int laser_refused_for_good(int token, uint32_t lba)
  * more read and the run-up. Only for READ(10), a DVD's or a BD's blocks: a
  * CD's tracks are read in order.
  *
+ * THE BLOCKS A MEDIUM ERROR LEAVES READ. A drive failing a read on a bad
+ * block has most often sent the blocks before it: they are returned, and
+ * the bad ones start after them - LASER_MEDIUM_NARROW_MIN_BLOCKS of them are
+ * recorded at once, what narrowing down would find with three more failed
+ * commands. Narrowing down is for a read failing before its first block.
+ *
  * A DAMAGED STRETCH IS SKIPPED, NOT NARROWED DOWN. A medium error at most
  * LASER_STRETCH_GAP_BLOCKS blocks past a range recorded unreadable is the
  * same stretch: a scratch along the track, which narrowing down crosses a
@@ -813,49 +819,65 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                     remember_refusal(entry, token, at, (int)st);
                 }
             } else if (st == LASER_ERR_IO &&
-                       why.cause == LASER_FAILURE_MEDIUM &&
-                       stretch_before(entry, at) != 0) {
-                /* A damaged stretch met already: skipped - see "a damaged
-                 * stretch is skipped" above. */
-                skip_stretch(entry, token, at, chunk,
-                             stretch_before(entry, at));
-            } else if (st == LASER_ERR_IO &&
-                       why.cause == LASER_FAILURE_MEDIUM && refusals &&
-                       !run_up_done) {
-                /* Maybe a weak zone the drive failed to land in: read up to
-                 * the chunk in order, then the chunk again - see "a medium
-                 * error is read again once, after a run-up" above. The
-                 * narrowing below starts from its failure. */
-                run_up_done = 1;
-                const int r = run_up_to(entry, token, at, block_size, cdb_len,
-                                        build_cdb, ctx);
-                if (r < 0) {
-                    return r;
-                }
-                run_up_retry = 1;
-                medium_since = 0;
-                continue;
-            } else if (st == LASER_ERR_IO &&
                        why.cause == LASER_FAILURE_MEDIUM) {
-                /* The drive reached the blocks and could not read them:
-                 * narrowed down so that those before the bad ones are
-                 * returned - see "a medium error is narrowed down" above.
-                 * The bridge is not to blame: it carried the answer. */
-                if (run_up_retry) {
-                    LOGI("token=%d: LBA %u x %d unreadable after a run-up "
-                         "too", token, at, chunk);
-                    run_up_retry = 0;
-                }
-                const int64_t now = laser_monotonic_ms_now();
-                if (medium_since == 0) {
-                    medium_since = now;
-                }
-                if (chunk > LASER_MEDIUM_NARROW_MIN_BLOCKS &&
-                    now - medium_since < LASER_MEDIUM_NARROW_MAX_MS) {
-                    smaller = (chunk / 2) * block_size;
-                    medium_split = 1;
+                /* The drive reached the blocks and could not read them.
+                 * Those it sent before stopping are read: the bad ones
+                 * start after them. */
+                const uint32_t bad = at + (uint32_t)sent;
+                const int left = chunk - sent;
+                const uint32_t stretch = stretch_before(entry, bad);
+                if (stretch != 0) {
+                    /* A damaged stretch met already: skipped - see "a
+                     * damaged stretch is skipped" above. */
+                    blocks_done += sent;
+                    skip_stretch(entry, token, bad, left, stretch);
+                } else if (sent == 0 && refusals && !run_up_done) {
+                    /* Maybe a weak zone the drive failed to land in: read
+                     * up to the chunk in order, then the chunk again - see
+                     * "a medium error is read again once, after a run-up"
+                     * above. Not when the drive sent blocks of it: then it
+                     * landed, and read on into the bad ones. */
+                    run_up_done = 1;
+                    const int r = run_up_to(entry, token, at, block_size,
+                                            cdb_len, build_cdb, ctx);
+                    if (r < 0) {
+                        return r;
+                    }
+                    run_up_retry = 1;
+                    medium_since = 0;
+                    continue;
                 } else {
-                    remember_unreadable(entry, token, at, chunk);
+                    if (run_up_retry) {
+                        LOGI("token=%d: LBA %u x %d unreadable after a "
+                             "run-up too", token, at, chunk);
+                        run_up_retry = 0;
+                    }
+                    if (sent > 0) {
+                        /* Where the bad blocks start is known: what
+                         * narrowing down would find, without its failed
+                         * commands - see "the blocks a medium error leaves
+                         * read" above. */
+                        blocks_done += sent;
+                        remember_unreadable(entry, token, bad,
+                                            left < LASER_MEDIUM_NARROW_MIN_BLOCKS
+                                            ? left : LASER_MEDIUM_NARROW_MIN_BLOCKS);
+                    } else {
+                        /* Narrowed down so that those before the bad ones
+                         * are returned - see "a medium error is narrowed
+                         * down" above. The bridge is not to blame: it
+                         * carried the answer. */
+                        const int64_t now = laser_monotonic_ms_now();
+                        if (medium_since == 0) {
+                            medium_since = now;
+                        }
+                        if (chunk > LASER_MEDIUM_NARROW_MIN_BLOCKS &&
+                            now - medium_since < LASER_MEDIUM_NARROW_MAX_MS) {
+                            smaller = (chunk / 2) * block_size;
+                            medium_split = 1;
+                        } else {
+                            remember_unreadable(entry, token, at, chunk);
+                        }
+                    }
                 }
             } else if (st == LASER_ERR_IO && chunk > 1 &&
                        tried > LASER_MIN_BYTES_PER_TRANSFER &&

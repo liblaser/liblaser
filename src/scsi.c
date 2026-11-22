@@ -765,6 +765,13 @@ laser_status_t laser_scsi_cdb_read(int token,
                 }
             }
         } else if (csw_status == USB_BOT_STATUS_FAIL) {
+            /* A read failed in its data phase: the bytes sent before are
+             * the sectors before the one it failed on - see
+             * laser_failure_t::received. */
+            if (is_read && data_in && actual_len != NULL &&
+                *actual_len > received && *actual_len < data_len) {
+                received = *actual_len;
+            }
             deferred_sense_t deferred;
             request_sense_locked(entry, &sense_key, &asc, &ascq, &deferred);
             last_sense_key = sense_key;

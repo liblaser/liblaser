@@ -488,6 +488,23 @@ static void lone_bad_blocks_stay_narrow(void)
     CHECK(laser_unreadable_blocks(1, 6000, 1000) == 4);
 }
 
+static void blocks_sent_before_a_medium_error_are_returned(void)
+{
+    check_case("a medium error at the 17th block, the 16 before sent");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 16;
+    bad_hi = 17;
+    sends_partial = 1;
+
+    /* One command: the 16 blocks returned, 4 from the bad one recorded -
+     * no run-up, the drive having landed, and no narrowing down. */
+    CHECK(laser_read_blocks(1, 0, 32, buffer) == 16);
+    CHECK(commands == 1);
+    CHECK(laser_unreadable_blocks(1, 16, 32) == 4);
+    CHECK(laser_unreadable_blocks(1, 15, 1) == 0);
+}
+
 int main(void)
 {
     pthread_mutex_init(&entry.io_lock, NULL);
@@ -508,6 +525,7 @@ int main(void)
     read_ahead_makes_no_run_up();
     damaged_stretch_is_skipped();
     lone_bad_blocks_stay_narrow();
+    blocks_sent_before_a_medium_error_are_returned();
 
     return check_result();
 }
