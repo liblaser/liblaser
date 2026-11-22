@@ -56,6 +56,14 @@
 #define LASER_RUN_UP_MAX_MS       8000
 #define LASER_RUN_UP_MAX_FAILURES 3
 
+/* A medium error at most this many blocks past a range recorded unreadable
+ * is the same damaged stretch - a scratch along the track, a protection's
+ * region - and is skipped rather than narrowed down: see read_chunked(). By
+ * as many blocks as the range before it holds, the skip doubling, and this
+ * many at most: 2 MiB, a second of a BD's film. */
+#define LASER_STRETCH_GAP_BLOCKS  64
+#define LASER_STRETCH_MAX_BLOCKS  1024
+
 /* Build the CDB for one chunk - the only thing the two public helpers below
  * do differently. */
 typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
@@ -314,6 +322,49 @@ static int run_up_to(laser_entry_t *entry, int token, uint32_t lba,
     return status;
 }
 
+/* The length of the range recorded unreadable that holds @p lba, or ends at
+ * most LASER_STRETCH_GAP_BLOCKS blocks before it - the longest, if several
+ * do; 0 if none: @p lba is then not in a damaged stretch already met. */
+static uint32_t stretch_before(laser_entry_t *entry, uint32_t lba)
+{
+    uint32_t longest = 0;
+
+    pthread_mutex_lock(&entry->learnt_lock);
+    for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS; i++) {
+        const uint64_t start = entry->unreadable[i].lba;
+        const uint32_t count = entry->unreadable[i].count;
+        if (count == 0 || lba < start ||
+            lba > start + count + LASER_STRETCH_GAP_BLOCKS) {
+            continue;
+        }
+        if (count > longest) {
+            longest = count;
+        }
+    }
+    pthread_mutex_unlock(&entry->learnt_lock);
+
+    return longest;
+}
+
+/* A medium error at @p lba, in a damaged stretch whose recorded range before
+ * it holds @p stretch blocks: the blocks from @p lba are recorded unreadable
+ * without asking the drive for them - as many as @p stretch, at least the
+ * @p chunk that failed, LASER_STRETCH_MAX_BLOCKS at most. */
+static void skip_stretch(laser_entry_t *entry, int token, uint32_t lba,
+                         int chunk, uint32_t stretch)
+{
+    uint32_t skip = stretch;
+    if (skip < (uint32_t)chunk) {
+        skip = (uint32_t)chunk;
+    }
+    if (skip > LASER_STRETCH_MAX_BLOCKS) {
+        skip = LASER_STRETCH_MAX_BLOCKS;
+    }
+    LOGI("token=%d: LBA %u: a medium error %u block(s) into a damaged "
+         "stretch, skipping %u blocks", token, lba, stretch, skip);
+    remember_unreadable(entry, token, lba, (int)skip);
+}
+
 /* A READ(10) of the single block @p lba was refused with @p status. Logged
  * once per block. */
 static void remember_refusal(laser_entry_t *entry, int token, uint32_t lba,
@@ -563,6 +614,20 @@ int laser_refused_for_good(int token, uint32_t lba)
  * more read and the run-up. Only for READ(10), a DVD's or a BD's blocks: a
  * CD's tracks are read in order.
  *
+ * A DAMAGED STRETCH IS SKIPPED, NOT NARROWED DOWN. A medium error at most
+ * LASER_STRETCH_GAP_BLOCKS blocks past a range recorded unreadable is the
+ * same stretch: a scratch along the track, which narrowing down crosses a
+ * few blocks at a time, four failed commands each - hours for a few MiB. The
+ * blocks from it are recorded unreadable at once, without the drive, as many
+ * as the range before holds (skip_stretch()): the range doubles at each
+ * failure, LASER_STRETCH_MAX_BLOCKS at most, and a few failures cross what
+ * narrowing took hours over. Neither a run-up nor narrowing down in it. The
+ * cost: up to LASER_STRETCH_MAX_BLOCKS readable blocks recorded past the
+ * stretch's end, a second of a film skipped, as a player skips a scratch.
+ * The first failure of a stretch is narrowed down, after its run-up, as any.
+ * A read made ahead failing in a stretch records nothing, as ever: the
+ * reader's read that follows skips at once, without the drive.
+ *
  * @param entry      the token's entry, pinned by the caller, for the
  *                   transfer cap and the blocks known not to read; NULL for
  *                   a token not registered, which costs only those:
@@ -655,6 +720,13 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
          * the first smaller read is their second attempt. */
         if (!ahead && entry != NULL && medium_since == 0 &&
             take_ahead_medium(entry, at)) {
+            /* In a damaged stretch: skipped, the read-ahead's failure
+             * being the drive's answer. */
+            const uint32_t stretch = stretch_before(entry, at);
+            if (stretch != 0) {
+                skip_stretch(entry, token, at, chunk, stretch);
+                return blocks_done > 0 ? blocks_done : (int)LASER_ERR_IO;
+            }
             medium_since = laser_monotonic_ms_now();
             medium_split = 1;
             if (chunk > LASER_MEDIUM_NARROW_MIN_BLOCKS) {
@@ -740,6 +812,13 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                 } else {
                     remember_refusal(entry, token, at, (int)st);
                 }
+            } else if (st == LASER_ERR_IO &&
+                       why.cause == LASER_FAILURE_MEDIUM &&
+                       stretch_before(entry, at) != 0) {
+                /* A damaged stretch met already: skipped - see "a damaged
+                 * stretch is skipped" above. */
+                skip_stretch(entry, token, at, chunk,
+                             stretch_before(entry, at));
             } else if (st == LASER_ERR_IO &&
                        why.cause == LASER_FAILURE_MEDIUM && refusals &&
                        !run_up_done) {

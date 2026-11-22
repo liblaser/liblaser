@@ -430,6 +430,64 @@ static void read_ahead_makes_no_run_up(void)
     CHECK(recorded_ranges() == 0);
 }
 
+/* Reads [from, to) as laser.c does: windows of 128 blocks, the blocks
+ * known not to read taken as read. */
+static void read_through(uint32_t from, uint32_t to)
+{
+    for (uint32_t lba = from; lba < to; ) {
+        const int r = laser_read_blocks(1, lba, 128, buffer);
+        if (r > 0) {
+            lba += (uint32_t)r;
+            continue;
+        }
+        const int known = laser_unreadable_blocks(1, lba, 128);
+        CHECK(known > 0);
+        if (known <= 0)
+            break;
+        lba += (uint32_t)known;
+    }
+}
+
+static void damaged_stretch_is_skipped(void)
+{
+    check_case("a scratch 8000 blocks long, played through");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 10000;
+    bad_hi = 18000;
+
+    read_through(9000, 20000);
+
+    /* The first failure narrowed down, after its run-up of 64 commands;
+     * then skips doubling up to 1024 blocks, one failed command each. With
+     * the 94 commands of the readable blocks around it, 170 in all, not
+     * thousands. */
+    CHECK(commands < 200);
+    /* Nothing before it is lost, and at most 1024 blocks after it. */
+    CHECK(laser_unreadable_blocks(1, 9999, 1) == 0);
+    CHECK(laser_unreadable_blocks(1, 10000, 20000) >= 8000);
+    CHECK(laser_unreadable_blocks(1, 10000, 20000) <= 8000 + 1024);
+    CHECK(laser_unreadable_blocks(1, 19100, 1) == 0);
+}
+
+static void lone_bad_blocks_stay_narrow(void)
+{
+    check_case("two bad spots far apart");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 5000;
+    bad_hi = 5004;
+
+    read_through(4900, 5200);
+    CHECK(laser_unreadable_blocks(1, 5000, 1000) == 4);
+
+    /* Another spot, well past the first: narrowed down too, not skipped. */
+    bad_lo = 6000;
+    bad_hi = 6004;
+    read_through(5200, 6200);
+    CHECK(laser_unreadable_blocks(1, 6000, 1000) == 4);
+}
+
 int main(void)
 {
     pthread_mutex_init(&entry.io_lock, NULL);
@@ -448,6 +506,8 @@ int main(void)
     weak_zone_is_read_after_a_run_up();
     run_up_is_made_once_a_read();
     read_ahead_makes_no_run_up();
+    damaged_stretch_is_skipped();
+    lone_bad_blocks_stay_narrow();
 
     return check_result();
 }
