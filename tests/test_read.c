@@ -21,13 +21,14 @@ static enum {
     BAD_MEDIUM,     /* MEDIUM ERROR */
     BAD_NO_ANSWER,  /* not answered, the drive otherwise ready */
     BAD_OTHER,      /* an I/O error that says nothing of the blocks */
-    BAD_LANDING,    /* MEDIUM ERROR, unless the command before ended where
-                     * this one starts: a weak zone read in order only */
+    BAD_LANDING,    /* MEDIUM ERROR, until a command far away has followed
+                     * a failed one: a first landing the drive fails */
 } bad_mode;
 static uint32_t bad_lo, bad_hi;
 
-/* Where the last command ended, failed or not: see BAD_LANDING. */
-static uint32_t last_end = UINT32_MAX;
+/* For BAD_LANDING: a landing has failed, and the drive has been far away
+ * since. */
+static int landing_failed, landed_away;
 
 /* A read not answered has sent the blocks before the bad one. */
 static int sends_partial;
@@ -94,7 +95,7 @@ laser_status_t laser_scsi_cdb_read(int token, const uint8_t *cdb, int cdb_len,
 
     commands++;
 
-    /* The run-up's reads ask for no explanation. */
+    /* Landing again asks for no explanation. */
     laser_failure_t ignored;
     if (why == NULL)
         why = &ignored;
@@ -113,11 +114,12 @@ laser_status_t laser_scsi_cdb_read(int token, const uint8_t *cdb, int cdb_len,
     const uint32_t lba = (uint32_t)cdb[2] << 24 | (uint32_t)cdb[3] << 16 |
                          (uint32_t)cdb[4] << 8 | cdb[5];
     const uint32_t count = (uint32_t)cdb[7] << 8 | cdb[8];
-    const uint32_t previous_end = last_end;
-    last_end = lba + count;
-
     if (bad_mode == BAD_LANDING) {
-        if (lba < bad_hi && lba + count > bad_lo && lba != previous_end) {
+        const uint32_t distance = lba >= bad_lo ? lba - bad_lo : bad_lo - lba;
+        if (landing_failed && distance >= 65536)
+            landed_away = 1;
+        if (lba < bad_hi && lba + count > bad_lo && !landed_away) {
+            landing_failed = 1;
             why->cause = LASER_FAILURE_MEDIUM;
             return LASER_ERR_IO;
         }
@@ -162,7 +164,7 @@ static void fresh_disc(void)
     bridge_limit = 0;
     transient_failures = 0;
     commands = 0;
-    last_end = UINT32_MAX;
+    landing_failed = landed_away = 0;
 }
 
 static uint8_t buffer[256 * 2048];
@@ -371,43 +373,42 @@ static void blocks_sent_before_a_stall_are_returned(void)
     CHECK(recorded_ranges() == 0);
 }
 
-static void weak_zone_is_read_after_a_run_up(void)
+static void failed_landing_is_read_after_landing_again(void)
 {
-    check_case("a weak zone the drive reads in order only, landed in");
+    check_case("a first landing the drive fails");
     fresh_disc();
     bad_mode = BAD_LANDING;
-    bad_lo = 3000;
-    bad_hi = 3100;
+    bad_lo = 21126816;
+    bad_hi = 21126816 + 4096;
 
-    /* Landing at 3010 fails; read up to it from 962, 2048 blocks in 64
-     * commands, the last of which, over 2978-3010, reads in order; then
-     * 3010 again, in order too. Nothing recorded. */
-    CHECK(laser_read_blocks(1, 3010, 32, buffer) == 32);
-    CHECK(commands == 1 + 64 + 1);
+    /* The landing fails; away to block 0 and back, the chunk again: read.
+     * Nothing recorded. */
+    CHECK(laser_read_blocks(1, 21126816, 32, buffer) == 32);
+    CHECK(commands == 3);
     CHECK(recorded_ranges() == 0);
 
-    /* Near the start of the disc, the run-up starts at block 0. */
+    /* Near the start of the disc, away past the chunk rather than to 0. */
     fresh_disc();
     bad_mode = BAD_LANDING;
     bad_lo = 100;
     bad_hi = 200;
     CHECK(laser_read_blocks(1, 128, 32, buffer) == 32);
-    CHECK(commands == 1 + 4 + 1);
+    CHECK(commands == 3);
     CHECK(recorded_ranges() == 0);
 }
 
-static void run_up_is_made_once_a_read(void)
+static void landing_again_is_once_a_read(void)
 {
-    check_case("an unreadable sector, a run-up not curing it");
+    check_case("an unreadable sector, landing again not curing it");
     fresh_disc();
     bad_mode = BAD_MEDIUM;
     bad_lo = 3000;
     bad_hi = 3004;
 
-    /* The failure, the run-up's 64 commands, the chunk again; then the
-     * narrowing, 16, 8 and 4 blocks - no second run-up. */
+    /* The failure, away and back, the chunk again; then the narrowing, 16,
+     * 8 and 4 blocks - not away again. */
     CHECK(laser_read_blocks(1, 3000, 32, buffer) == LASER_ERR_IO);
-    CHECK(commands == 1 + 64 + 1 + 3);
+    CHECK(commands == 1 + 1 + 1 + 3);
     CHECK(laser_unreadable_blocks(1, 3000, 32) == 4);
 
     /* Recorded: asked for again, answered without the drive. */
@@ -416,15 +417,15 @@ static void run_up_is_made_once_a_read(void)
     CHECK(commands == 0);
 }
 
-static void read_ahead_makes_no_run_up(void)
+static void read_ahead_does_not_land_again(void)
 {
-    check_case("a read-ahead landing in a weak zone");
+    check_case("a read-ahead failing its landing");
     fresh_disc();
     bad_mode = BAD_LANDING;
     bad_lo = 3000;
     bad_hi = 3100;
 
-    /* Tried once, given up: the reader's own read makes the run-up. */
+    /* Tried once, given up: the reader's own read lands again. */
     CHECK(laser_read_blocks_ahead(1, 3010, 32, buffer) == LASER_ERR_IO);
     CHECK(commands == 1);
     CHECK(recorded_ranges() == 0);
@@ -458,11 +459,11 @@ static void damaged_stretch_is_skipped(void)
 
     read_through(9000, 20000);
 
-    /* The first failure narrowed down, after its run-up of 64 commands;
-     * then skips doubling up to 1024 blocks, one failed command each. With
-     * the 94 commands of the readable blocks around it, 170 in all, not
-     * thousands. */
-    CHECK(commands < 200);
+    /* The first failure narrowed down, after landing again; then skips
+     * doubling up to 1024 blocks, one failed command each. With the 94
+     * commands of the readable blocks around it, about a hundred in all,
+     * not thousands. */
+    CHECK(commands < 130);
     /* Nothing before it is lost, and at most 1024 blocks after it. */
     CHECK(laser_unreadable_blocks(1, 9999, 1) == 0);
     CHECK(laser_unreadable_blocks(1, 10000, 20000) >= 8000);
@@ -498,7 +499,7 @@ static void blocks_sent_before_a_medium_error_are_returned(void)
     sends_partial = 1;
 
     /* One command: the 16 blocks returned, 4 from the bad one recorded -
-     * no run-up, the drive having landed, and no narrowing down. */
+     * not landing again, the drive having landed, and no narrowing down. */
     CHECK(laser_read_blocks(1, 0, 32, buffer) == 16);
     CHECK(commands == 1);
     CHECK(laser_unreadable_blocks(1, 16, 32) == 4);
@@ -520,9 +521,9 @@ int main(void)
     transfer_size_is_lowered_on_a_repeated_failure();
     transfer_size_survives_a_passing_failure();
     blocks_sent_before_a_stall_are_returned();
-    weak_zone_is_read_after_a_run_up();
-    run_up_is_made_once_a_read();
-    read_ahead_makes_no_run_up();
+    failed_landing_is_read_after_landing_again();
+    landing_again_is_once_a_read();
+    read_ahead_does_not_land_again();
     damaged_stretch_is_skipped();
     lone_bad_blocks_stay_narrow();
     blocks_sent_before_a_medium_error_are_returned();
