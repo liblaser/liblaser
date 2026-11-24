@@ -286,6 +286,11 @@ typedef struct {
     uint64_t xfer_us;
     uint64_t xfer_count;
     int      slow_warned;
+    /* Medium errors answered "no seek complete" (03/02/00) since the
+     * registration, and whether that has been reported: see
+     * note_seek_failure_locked() in scsi.c. Under io_lock. */
+    int      seek_failures;
+    int      seek_warned;
     /* The block after the last successful read: only a read starting there
      * is sampled, a seek costing what a slow link does. Under io_lock. */
     uint32_t xfer_next_lba;

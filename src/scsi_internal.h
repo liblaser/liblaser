@@ -131,6 +131,10 @@
 #define SCSI_ASCQ_NR_START_NEEDED       0x02
 #define SCSI_ASCQ_NR_INTERVENTION       0x03
 
+/* Under MEDIUM ERROR, 02h/00h NO SEEK COMPLETE: the drive could not settle
+ * on the track asked for. */
+#define SCSI_ASC_NO_SEEK_COMPLETE       0x02
+
 #define SCSI_ASC_MEDIUM_NOT_PRESENT     0x3a
 /* The qualifiers under 3Ah, which the spin-up wait tells apart. 3Ah/02h, tray
  * OPEN, is a physical fact no command or wait changes. 3Ah/00h and 3Ah/01h

@@ -228,10 +228,13 @@ void laser_forget_disc(laser_entry_t *e, int token)
     (void) token;
 }
 
+/* Warnings saying the drive failed to seek: see seek_failures(). */
+static int seek_warnings;
+
 void laser_log(laser_log_level_t level, const char *fmt, ...)
 {
-    (void) level;
-    (void) fmt;
+    if (level == LASER_LOG_WARN && strstr(fmt, "failed to seek") != NULL)
+        seek_warnings++;
 }
 
 /* ---- helpers ---- */
@@ -476,6 +479,32 @@ static void sense(void)
     CHECK(why.cause == LASER_FAILURE_MEDIUM);
 }
 
+static void seek_failures(void)
+{
+    laser_failure_t why;
+
+    begin("no seek complete, again and again: the supply named, once",
+          reads_fail);
+    sense_key = 3, sense_asc = 0x02, sense_ascq = 0;
+    entry.seek_failures = entry.seek_warned = 0;
+    seek_warnings = 0;
+    /* Two attempts a read: the third failure is in the second read. */
+    CHECK(read_block(&why, 2) == LASER_ERR_IO);
+    CHECK(seek_warnings == 0);
+    CHECK(read_block(&why, 2) == LASER_ERR_IO);
+    CHECK(seek_warnings == 1);
+    CHECK(read_block(&why, 2) == LASER_ERR_IO);
+    CHECK(seek_warnings == 1);
+
+    begin("an unreadable sector: not taken for the supply", reads_fail);
+    sense_key = 3, sense_asc = 0x11, sense_ascq = 5;
+    entry.seek_failures = entry.seek_warned = 0;
+    seek_warnings = 0;
+    for (int i = 0; i < 3; i++)
+        CHECK(read_block(&why, 2) == LASER_ERR_IO);
+    CHECK(seek_warnings == 0);
+}
+
 static void deferred_sense(void)
 {
     laser_failure_t why;
@@ -580,6 +609,7 @@ int main(void)
 
     framing();
     sense();
+    seek_failures();
     deferred_sense();
     unanswered_reads();
     speed();

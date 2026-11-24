@@ -407,6 +407,42 @@ static void sample_throughput_locked(laser_entry_t *entry, int data_len,
          (unsigned long long)per_ms, entry->ep_max_packet);
 }
 
+/* Seek failures - MEDIUM ERROR, NO SEEK COMPLETE - before they are reported
+ * as a sign of the drive's supply: one is a disc's flaw, a few in a session
+ * are not. */
+#define LASER_SEEK_FAILURES_WARN 3
+
+/* Counts the drive's "no seek complete" answers, and reports once per
+ * registration, when they keep coming, that the supply may be the cause.
+ *
+ * The other face of an underpowered drive, beside the slow reads above: a
+ * drive on a supply that sags or ripples under the current of a seek - a
+ * phone charger on a Y cable, a host port too weak for it - reads in order
+ * and fails to settle on a track after a jump, then often goes on failing
+ * every seek, on any part of the disc. A BD drive did so on a 24 W charger
+ * and read the same zone on a PC's USB 3 port alone. Nothing in the
+ * commands cures it; a powered hub with a regulated supply does.
+ *
+ * Caller MUST already hold entry->io_lock. */
+static void note_seek_failure_locked(laser_entry_t *entry, uint8_t sense_key,
+                                     uint8_t asc)
+{
+    if (sense_key != SCSI_SENSE_KEY_MEDIUM_ERROR ||
+        asc != SCSI_ASC_NO_SEEK_COMPLETE || entry->seek_warned) {
+        return;
+    }
+    if (++entry->seek_failures < LASER_SEEK_FAILURES_WARN) {
+        return;
+    }
+    entry->seek_warned = 1;
+
+    /* Kept under the log line limit (LOG_LINE_MAX in registry.c). */
+    LOGW("token=%d, usb %04x:%04x: the drive failed to seek %d times (sense "
+         "03/02/00) - a drive on a poor supply does this: try a powered hub "
+         "with a regulated supply rather than a charger or a Y cable",
+         entry->token, entry->vid, entry->pid, entry->seek_failures);
+}
+
 /* ============================================================================
  * Public: laser_scsi_cdb() - the generic, retrying, mutex-protected CDB
  * primitive everything else goes through.
@@ -947,6 +983,10 @@ laser_status_t laser_scsi_cdb_read(int token,
             reason_logged = 1;
             result = LASER_ERR_REFUSED;
             break;
+        }
+
+        if (is_read) {
+            note_seek_failure_locked(entry, sense_key, asc);
         }
 
         /* An unreadable sector: see LASER_READ_MAX_MEDIUM_ERRORS. The same
