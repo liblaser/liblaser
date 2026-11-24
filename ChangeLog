@@ -1,4 +1,4 @@
-XXXX-XX-XX: version 0.3.2
+2026-11-é4: version 0.3.2
     - Report when a device is not an optical drive
     - Fallback to read CD-DA as any sector type when a drive refuses the CD-DA form
     - Narrow a medium error down to the blocks that do not read
