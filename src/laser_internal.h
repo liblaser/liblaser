@@ -330,6 +330,12 @@ typedef struct {
      * command, under io_lock. */
     int long_data;
 
+    /** Nonzero while a command laser_scsi_cdb_once() gives a time of its
+     * own is in flight: its data phase's, in milliseconds, in place of the
+     * usual - a read's included. Set and cleared around the command, under
+     * io_lock. */
+    unsigned data_timeout_ms;
+
     /** Set by laser_bot_send_locked() when such a read's data phase ran out
      * of that time: the drive had all a read is given, and the read is not
      * sent again. Cleared at the start of every transaction, under

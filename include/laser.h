@@ -424,6 +424,30 @@ laser_status_t laser_scsi_cdb(int token,
                               uint8_t *data, int data_len,
                               int data_in, int *actual_len);
 
+/**
+ * laser_scsi_cdb(), for a query a drive may take too long to answer to be
+ * worth waiting for: one attempt, its data phase given @p timeout_ms, and
+ * no retry - nor a wait for a drive spinning up, or one to be started.
+ *
+ * As Linux sends a packet command through CDROM_SEND_PACKET, with a time of
+ * its own: READ TOC's CD-Text, which a drive looks for in the lead-in of a
+ * disc that has none for over ten seconds before it says so.
+ *
+ * A data phase that times out still ends in a Reset Recovery, without which
+ * the transport cannot be used again, and in LASER_ERR_IO. Everything else -
+ * argument validation, CSS sessions, serialization, sense - is as
+ * laser_scsi_cdb().
+ *
+ * @param timeout_ms The data phase's time, in milliseconds - a read's
+ *                   included; 0 for the usual.
+ * @return As laser_scsi_cdb().
+ */
+laser_status_t laser_scsi_cdb_once(int token,
+                                   const uint8_t *cdb, int cdb_len,
+                                   uint8_t *data, int data_len,
+                                   int data_in, int *actual_len,
+                                   unsigned timeout_ms);
+
 /* ============================================================================
  * CSS authentication sessions
  *

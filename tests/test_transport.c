@@ -52,6 +52,11 @@ static int     data_out_len;
 
 static int resets;
 
+/* The time the host gave the first transfer from the device after the last
+ * command block - the data phase's, for a command that has one. */
+static unsigned first_in_timeout;
+static int      first_in_seen;
+
 /* Called for each command block, with how many of its opcode that makes. */
 static void (*scenario)(const uint8_t *cdb, int nth);
 
@@ -121,9 +126,13 @@ int libusb_bulk_transfer(libusb_device_handle *handle, unsigned char endpoint,
                          unsigned int timeout)
 {
     (void) handle;
-    (void) timeout;
 
     const int out = !(endpoint & 0x80);
+
+    if (!out && !first_in_seen) {
+        first_in_seen = 1;
+        first_in_timeout = timeout;
+    }
 
     if (out && expects_data_out) {
         data_out_len = length;
@@ -144,6 +153,7 @@ int libusb_bulk_transfer(libusb_device_handle *handle, unsigned char endpoint,
         last_cdb_len = cbw.bCBWCBLength;
         memcpy(last_cdb, cbw.CBWCB, sizeof(last_cdb));
         queue_head = queue_tail = 0;
+        first_in_seen = 0;
         *transferred = length;
         scenario(cbw.CBWCB, ++sent[cbw.CBWCB[0]]);
         return 0;
@@ -243,6 +253,7 @@ void laser_log(laser_log_level_t level, const char *fmt, ...)
 #define OP_REQUEST_SENSE     0x03
 #define OP_START_STOP_UNIT   0x1b
 #define OP_READ_10           0x28
+#define OP_READ_TOC          0x43
 #define OP_GET_CONFIGURATION 0x46
 #define OP_SET_STREAMING     0xb6
 #define OP_SET_CD_SPEED      0xbb
@@ -270,7 +281,46 @@ static laser_status_t read_block(laser_failure_t *why, int max_resets)
                                &actual, 2, max_resets, why);
 }
 
+/* READ TOC's CD-Text header, sent once in @p timeout_ms. */
+static laser_status_t cd_text_once(int *actual, unsigned timeout_ms)
+{
+    static const uint8_t cdb[10] = { OP_READ_TOC, 0x02, 5, 0, 0, 0, 0, 0, 4, 0 };
+    *actual = 0;
+    return laser_scsi_cdb_once(1, cdb, sizeof(cdb), block, 4, 1, actual,
+                               timeout_ms);
+}
+
 /* ---- scenarios ---- */
+
+/* A drive looking for CD-Text in the lead-in of a disc that has none: no
+ * answer to READ TOC, ready otherwise. */
+static void cd_text_searched(const uint8_t *cdb, int nth)
+{
+    (void) nth;
+    if (cdb[0] != OP_READ_TOC)
+        queue_status(0);
+}
+
+/* A drive answering READ TOC's CD-Text header: 2 bytes after the length,
+ * no text. */
+static void cd_text_none(const uint8_t *cdb, int nth)
+{
+    static const uint8_t header[4] = { 0, 2, 0, 0 };
+    (void) nth;
+    if (cdb[0] == OP_READ_TOC)
+        queue_bytes(header, sizeof(header));
+    queue_status(0);
+}
+
+/* A drive becoming ready: READ TOC fails, sense 02/04/01. */
+static void becoming_ready(const uint8_t *cdb, int nth)
+{
+    (void) nth;
+    if (cdb[0] == OP_REQUEST_SENSE)
+        queue_sense(0x70, 2, 4, 1);
+    else
+        queue_status(1);
+}
 
 static void device_answers(const uint8_t *cdb, int nth)
 {
@@ -573,6 +623,35 @@ static void unanswered_reads(void)
     CHECK(why.received == 1024);
 }
 
+static void once(void)
+{
+    int actual;
+
+    begin("a query answered at once", cd_text_none);
+    CHECK(cd_text_once(&actual, 1000) == LASER_OK);
+    CHECK(actual == 4 && block[1] == 2);
+    CHECK(first_in_timeout == 1000);
+
+    begin("a query not answered in its time: one attempt, one Reset Recovery",
+          cd_text_searched);
+    CHECK(cd_text_once(&actual, 1000) == LASER_ERR_IO);
+    CHECK(sent[OP_READ_TOC] == 1);
+    CHECK(resets == 1);
+    CHECK(first_in_timeout == 1000);
+    CHECK(!entry.device_gone);
+
+    begin("a query to a drive becoming ready: not waited for", becoming_ready);
+    CHECK(cd_text_once(&actual, 1000) == LASER_ERR_IO);
+    CHECK(sent[OP_READ_TOC] == 1);
+
+    begin("the time given back to the next command", cd_text_none);
+    CHECK(cd_text_once(&actual, 1000) == LASER_OK);
+    CHECK(laser_scsi_cdb(1, (const uint8_t[10]){ OP_READ_TOC, 0x02, 5, 0, 0,
+                                                 0, 0, 0, 4, 0 }, 10,
+                         block, 4, 1, &actual) == LASER_OK);
+    CHECK(first_in_timeout == DATA_PHASE_TIMEOUT_MS);
+}
+
 static void speed(void)
 {
     begin("2x asked of a drive holding a DVD", drive_with_a_dvd);
@@ -612,6 +691,7 @@ int main(void)
     seek_failures();
     deferred_sense();
     unanswered_reads();
+    once();
     speed();
 
     return check_result();

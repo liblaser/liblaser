@@ -13,6 +13,7 @@ laser_public_symbols = [
     'laser_release',
     'laser_token_not_ready',
     'laser_scsi_cdb',
+    'laser_scsi_cdb_once',
     'laser_css_session_begin',
     'laser_css_session_end',
     'laser_read_blocks',

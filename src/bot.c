@@ -273,6 +273,8 @@ int laser_bot_send_locked(laser_entry_t *entry,
                                    : CBW_PHASE_TIMEOUT_MS;
     const unsigned int data_timeout = entry->probe_timeouts
                                     ? PROBE_DATA_PHASE_TIMEOUT_MS
+                                    : entry->data_timeout_ms != 0
+                                    ? entry->data_timeout_ms
                                     : DATA_PHASE_TIMEOUT_MS;
     const unsigned int csw_timeout = entry->probe_timeouts
                                    ? PROBE_CSW_PHASE_TIMEOUT_MS
@@ -345,7 +347,8 @@ int laser_bot_send_locked(laser_entry_t *entry,
     if (data_len > 0 && data) {
         unsigned char ep = data_in ? entry->ep_in : entry->ep_out;
         const int long_read = entry->long_data && data_in &&
-                              !entry->probe_timeouts;
+                              !entry->probe_timeouts &&
+                              entry->data_timeout_ms == 0;
         int stopped = 0;
 
         if (long_read) {

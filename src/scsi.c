@@ -460,6 +460,25 @@ void laser_retry_delay(laser_entry_t *entry, int idempotent)
         usleep(LASER_RETRY_DELAY_MS * 1000);
 }
 
+/* How far a command is pursued: by laser_scsi_cdb() and
+ * laser_scsi_cdb_read(), through every retry; by laser_scsi_cdb_once(), for
+ * one attempt in a time of its own. */
+typedef struct {
+    /* Attempts at most, LASER_MAX_RETRIES. With one, no wait either - for a
+     * drive spinning up, or one to be started. */
+    int max_attempts;
+    /* See laser_scsi_cdb_read(). */
+    int max_medium_errors;
+    int max_resets;
+    /* The data phase's time, in milliseconds; 0 for the usual. */
+    unsigned data_timeout_ms;
+} cdb_limits_t;
+
+static laser_status_t scsi_cdb(int token, const uint8_t *cdb, int cdb_len,
+                               uint8_t *data, int data_len, int data_in,
+                               int *actual_len, const cdb_limits_t *limits,
+                               laser_failure_t *why);
+
 laser_status_t laser_scsi_cdb(int token,
                               const uint8_t *cdb, int cdb_len,
                               uint8_t *data, int data_len,
@@ -470,6 +489,22 @@ laser_status_t laser_scsi_cdb(int token,
                                LASER_READ_MAX_RESETS, NULL);
 }
 
+laser_status_t laser_scsi_cdb_once(int token,
+                                   const uint8_t *cdb, int cdb_len,
+                                   uint8_t *data, int data_len,
+                                   int data_in, int *actual_len,
+                                   unsigned timeout_ms)
+{
+    const cdb_limits_t limits = {
+        .max_attempts = 1,
+        .max_medium_errors = LASER_READ_MAX_MEDIUM_ERRORS,
+        .max_resets = LASER_READ_MAX_RESETS,
+        .data_timeout_ms = timeout_ms,
+    };
+    return scsi_cdb(token, cdb, cdb_len, data, data_len, data_in, actual_len,
+                    &limits, NULL);
+}
+
 /* See scsi_internal.h. */
 laser_status_t laser_scsi_cdb_read(int token,
                                    const uint8_t *cdb, int cdb_len,
@@ -478,6 +513,25 @@ laser_status_t laser_scsi_cdb_read(int token,
                                    int max_medium_errors, int max_resets,
                                    laser_failure_t *why)
 {
+    const cdb_limits_t limits = {
+        .max_attempts = LASER_MAX_RETRIES,
+        .max_medium_errors = max_medium_errors,
+        .max_resets = max_resets,
+        .data_timeout_ms = 0,
+    };
+    return scsi_cdb(token, cdb, cdb_len, data, data_len, data_in, actual_len,
+                    &limits, why);
+}
+
+static laser_status_t scsi_cdb(int token, const uint8_t *cdb, int cdb_len,
+                               uint8_t *data, int data_len, int data_in,
+                               int *actual_len, const cdb_limits_t *limits,
+                               laser_failure_t *why)
+{
+    const int max_attempts = limits->max_attempts;
+    const int max_medium_errors = limits->max_medium_errors;
+    const int max_resets = limits->max_resets;
+
     if (why != NULL) {
         why->cause = LASER_FAILURE_OTHER;
         why->sense_key = 0xff;
@@ -629,7 +683,7 @@ laser_status_t laser_scsi_cdb_read(int token,
         }
     }
 
-    for (int attempt = 1; !answered_already && attempt <= LASER_MAX_RETRIES;
+    for (int attempt = 1; !answered_already && attempt <= max_attempts;
          attempt++) {
         attempts_made = attempt;
 
@@ -653,8 +707,10 @@ laser_status_t laser_scsi_cdb_read(int token,
 
         entry->slow_status = cdb_status_is_slow(cdb, cdb_len);
         entry->long_data = is_read;
+        entry->data_timeout_ms = limits->data_timeout_ms;
         int rc = laser_bot_send_locked(entry, cdb, cdb_len, data, data_len,
                                          data_in, actual_len, &csw_status);
+        entry->data_timeout_ms = 0;
         entry->long_data = 0;
         entry->slow_status = 0;
         if (rc == 0) {
@@ -713,7 +769,7 @@ laser_status_t laser_scsi_cdb_read(int token,
              * for REQUEST SENSE to explain. The attempt still counts. */
             /* The budget this attempt counts against: a read's resets, at
              * most one after a data phase that had all of a read's time. */
-            const int budget = !is_read ? LASER_MAX_RETRIES
+            const int budget = !is_read ? max_attempts
                              : entry->read_timed_out ? 1 : max_resets;
             LOGW("token=%d: cdb 0x%02x%s ended in a Reset Recovery (attempt "
                  "%d/%d)", token, cdb[0], where,
@@ -1037,7 +1093,8 @@ laser_status_t laser_scsi_cdb_read(int token,
          * drive answering "becoming ready" from then on. Without spending
          * an attempt. A second such answer gets the ordinary delayed
          * retry. */
-        if (medium == MEDIUM_SENSE_START_NEEDED && !start_sent) {
+        if (medium == MEDIUM_SENSE_START_NEEDED && !start_sent &&
+            max_attempts > 1) {
             static const uint8_t start_unit[6] = {
                 0x1b, 0x01 /* IMMED */, 0x00, 0x00, 0x01 /* START */, 0x00,
             };
@@ -1056,7 +1113,7 @@ laser_status_t laser_scsi_cdb_read(int token,
          * minutes took 45 s, past the spin-up wait at registration. Waited
          * out under LASER_BECOMING_READY_MAX_WALL_MS, without spending
          * attempts; cancellation is still checked on every round. */
-        if (medium == MEDIUM_SENSE_LOADING) {
+        if (medium == MEDIUM_SENSE_LOADING && max_attempts > 1) {
             if (!becoming_ready) {
                 becoming_ready = 1;
                 becoming_ready_since = laser_monotonic_ms_now();
@@ -1088,7 +1145,7 @@ laser_status_t laser_scsi_cdb_read(int token,
             continue;
         }
 
-        if (attempt < LASER_MAX_RETRIES) {
+        if (attempt < max_attempts) {
             laser_retry_delay(entry, idempotent);
         }
     }
@@ -1099,9 +1156,11 @@ laser_status_t laser_scsi_cdb_read(int token,
      * LIBUSB_ERROR_IO rather than NO_DEVICE, which one attempt cannot tell
      * from a bridge having a bad moment - but a device that will not take 31
      * bytes on any of LASER_MAX_RETRIES attempts is not there. Never over a
-     * cancellation, which the caller asked for. */
+     * cancellation, which the caller asked for, nor over the one attempt of
+     * laser_scsi_cdb_once(), which says too little. */
     if (result != LASER_OK && result != LASER_ERR_CANCELLED &&
-        attempts_made > 0 && cbw_never_sent == attempts_made) {
+        max_attempts > 1 && attempts_made > 0 &&
+        cbw_never_sent == attempts_made) {
         LOGW("token=%d: cdb 0x%02x - the CBW could not be sent on any of "
              "%d attempt(s); treating the device as gone",
              token, cdb[0], attempts_made);
