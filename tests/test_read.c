@@ -23,12 +23,23 @@ static enum {
     BAD_OTHER,      /* an I/O error that says nothing of the blocks */
     BAD_LANDING,    /* MEDIUM ERROR, until a command far away has followed
                      * a failed one: a first landing the drive fails */
+    BAD_LOST,       /* MEDIUM ERROR, and every read after it too - block 0
+                     * included - until the disc is started again; then the
+                     * blocks read if restart_cures */
+    BAD_SPOTS,      /* MEDIUM ERROR on 4 blocks every 160: a weak zone */
 } bad_mode;
 static uint32_t bad_lo, bad_hi;
 
 /* For BAD_LANDING: a landing has failed, and the drive has been far away
  * since. */
 static int landing_failed, landed_away;
+
+/* For BAD_LOST: the drive has lost its way; whether a restart lets it read
+ * the blocks; whether it has been restarted. */
+static int lost, restart_cures, restarted_once;
+
+/* START STOP UNIT commands received, stops and starts. */
+static int stops, starts;
 
 /* A read not answered has sent the blocks before the bad one. */
 static int sends_partial;
@@ -40,6 +51,10 @@ static int bridge_limit;
 static int transient_failures;
 
 static int commands;
+
+/* Of those, the reads failed on a spot of BAD_SPOTS; failed with BAD_MEDIUM. */
+static int spot_failures;
+static int medium_failures;
 
 /* ---- what read.c calls ---- */
 
@@ -114,7 +129,14 @@ laser_status_t laser_scsi_cdb_read(int token, const uint8_t *cdb, int cdb_len,
     const uint32_t lba = (uint32_t)cdb[2] << 24 | (uint32_t)cdb[3] << 16 |
                          (uint32_t)cdb[4] << 8 | cdb[5];
     const uint32_t count = (uint32_t)cdb[7] << 8 | cdb[8];
-    if (bad_mode == BAD_LANDING) {
+    if (bad_mode == BAD_LOST) {
+        const int in_range = lba < bad_hi && lba + count > bad_lo;
+        if (lost || (in_range && !(restart_cures && restarted_once))) {
+            lost = 1;
+            why->cause = LASER_FAILURE_MEDIUM;
+            return LASER_ERR_IO;
+        }
+    } else if (bad_mode == BAD_LANDING) {
         const uint32_t distance = lba >= bad_lo ? lba - bad_lo : bad_lo - lba;
         if (landing_failed && distance >= 65536)
             landed_away = 1;
@@ -123,9 +145,19 @@ laser_status_t laser_scsi_cdb_read(int token, const uint8_t *cdb, int cdb_len,
             why->cause = LASER_FAILURE_MEDIUM;
             return LASER_ERR_IO;
         }
+    } else if (bad_mode == BAD_SPOTS) {
+        for (uint32_t spot = bad_lo; spot < bad_hi; spot += 160) {
+            if (lba < spot + 4 && lba + count > spot) {
+                spot_failures++;
+                why->cause = LASER_FAILURE_MEDIUM;
+                return LASER_ERR_IO;
+            }
+        }
     } else if (bad_mode != BAD_NONE && lba < bad_hi && lba + count > bad_lo) {
-        if (bad_mode == BAD_MEDIUM)
+        if (bad_mode == BAD_MEDIUM) {
+            medium_failures++;
             why->cause = LASER_FAILURE_MEDIUM;
+        }
         if (bad_mode == BAD_NO_ANSWER)
             why->cause = LASER_FAILURE_NO_ANSWER;
         if (sends_partial && lba < bad_lo)
@@ -134,6 +166,31 @@ laser_status_t laser_scsi_cdb_read(int token, const uint8_t *cdb, int cdb_len,
     }
 
     *actual_len = data_len;
+    return LASER_OK;
+}
+
+/* START STOP UNIT, the one other command read.c sends. */
+laser_status_t laser_scsi_cdb(int token, const uint8_t *cdb, int cdb_len,
+                              uint8_t *data, int data_len, int data_in,
+                              int *actual_len)
+{
+    (void) token;
+    (void) cdb_len;
+    (void) data;
+    (void) data_len;
+    (void) data_in;
+    (void) actual_len;
+
+    commands++;
+    if (cdb[0] == 0x1b) {
+        if (cdb[4] & 0x01) {
+            starts++;
+            lost = 0;
+            restarted_once = 1;
+        } else {
+            stops++;
+        }
+    }
     return LASER_OK;
 }
 
@@ -165,6 +222,10 @@ static void fresh_disc(void)
     transient_failures = 0;
     commands = 0;
     landing_failed = landed_away = 0;
+    lost = restart_cures = restarted_once = 0;
+    stops = starts = 0;
+    entry.restart_pending = 0;
+    entry.restarts_in_area = 0;
 }
 
 static uint8_t buffer[256 * 2048];
@@ -417,6 +478,75 @@ static void landing_again_is_once_a_read(void)
     CHECK(commands == 0);
 }
 
+static void lost_drive_is_restarted(void)
+{
+    check_case("a drive lost after a failure, block 0 failing too");
+    fresh_disc();
+    bad_mode = BAD_LOST;
+    restart_cures = 1;
+    bad_lo = 10914751;
+    bad_hi = 10916000;
+
+    /* The failure; away to block 0, failed too; the disc stopped and
+     * started; away again; the chunk again: read. Nothing recorded. */
+    CHECK(laser_read_blocks(1, 10914784, 32, buffer) == 32);
+    CHECK(stops == 1 && starts == 1);
+    CHECK(commands == 6);
+    CHECK(recorded_ranges() == 0);
+
+    check_case("a drive lost, and failing after a restart too");
+    fresh_disc();
+    bad_mode = BAD_LOST;
+    restart_cures = 0;
+    bad_lo = 10914751;
+    bad_hi = 10916000;
+
+    /* The same, the chunk failing again: 2048 blocks recorded at once, not
+     * narrowed down... */
+    CHECK(laser_read_blocks(1, 10914784, 32, buffer) == LASER_ERR_IO);
+    CHECK(stops == 1 && starts == 1);
+    CHECK(commands == 6);
+    CHECK(laser_unreadable_blocks(1, 10914784, 4096) == 2048);
+
+    /* ...answered without the drive... */
+    commands = 0;
+    CHECK(laser_read_blocks(1, 10915000, 32, buffer) == LASER_ERR_IO);
+    CHECK(commands == 0);
+
+    /* ...and the disc restarted before the read past them: read. */
+    CHECK(laser_read_blocks(1, 10914784 + 2048, 32, buffer) == 32);
+    CHECK(stops == 2 && starts == 2);
+    CHECK(commands == 3);
+
+    check_case("a drive restarting does not help: two restarts, no more");
+    fresh_disc();
+    bad_mode = BAD_LOST;
+    restart_cures = 0;
+    bad_lo = 20000000;
+    bad_hi = 20100000;
+    for (uint32_t lba = 20000000; lba < 20020000; ) {
+        const int r = laser_read_blocks(1, lba, 32, buffer);
+        const int known = laser_unreadable_blocks(1, lba, 4096);
+        if (r > 0) {
+            lba += (uint32_t)r;
+            continue;
+        }
+        CHECK(known > 0);
+        if (known <= 0)
+            break;
+        lba += (uint32_t)known;
+    }
+    CHECK(starts == 2);
+
+    check_case("a sector that does not read, block 0 reading: no restart");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 3000;
+    bad_hi = 3004;
+    laser_read_blocks(1, 3000, 32, buffer);
+    CHECK(starts == 0 && stops == 0);
+}
+
 static void read_ahead_does_not_land_again(void)
 {
     check_case("a read-ahead failing its landing");
@@ -457,18 +587,38 @@ static void damaged_stretch_is_skipped(void)
     bad_lo = 10000;
     bad_hi = 18000;
 
-    read_through(9000, 20000);
+    medium_failures = 0;
+    read_through(9000, 30000);
 
-    /* The first failure narrowed down, after landing again; then skips
-     * doubling up to 1024 blocks, one failed command each. With the 94
-     * commands of the readable blocks around it, about a hundred in all,
-     * not thousands. */
-    CHECK(commands < 130);
-    /* Nothing before it is lost, and at most 1024 blocks after it. */
+    /* The first failure narrowed down, after landing again - five failed
+     * reads - then skips doubling, one failed read each: about fifteen in
+     * all, not thousands. */
+    CHECK(medium_failures <= 20);
+    /* Nothing before it is lost, and at most as much again after it. */
     CHECK(laser_unreadable_blocks(1, 9999, 1) == 0);
     CHECK(laser_unreadable_blocks(1, 10000, 20000) >= 8000);
-    CHECK(laser_unreadable_blocks(1, 10000, 20000) <= 8000 + 1024);
-    CHECK(laser_unreadable_blocks(1, 19100, 1) == 0);
+    CHECK(laser_unreadable_blocks(1, 10000, 20000) <= 2 * 8000);
+}
+
+static void dead_band_is_crossed(void)
+{
+    check_case("1.4 million blocks that do not read, crossed");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 1000000;
+    bad_hi = 2400000;
+    medium_failures = 0;
+
+    read_through(999000, 3000000);
+
+    /* The first failure narrowed down, after landing again - five failed
+     * reads - then a skip doubling at each failure: about twenty failed
+     * reads, not tens of thousands. */
+    CHECK(medium_failures <= 25);
+    CHECK(laser_unreadable_blocks(1, 999999, 1) == 0);
+    /* Read on past the band: at most as many blocks as it held lost after
+     * it. */
+    CHECK(laser_unreadable_blocks(1, 2400000 + 1400000, 1) == 0);
 }
 
 static void lone_bad_blocks_stay_narrow(void)
@@ -482,11 +632,36 @@ static void lone_bad_blocks_stay_narrow(void)
     read_through(4900, 5200);
     CHECK(laser_unreadable_blocks(1, 5000, 1000) == 4);
 
-    /* Another spot, well past the first: narrowed down too, not skipped. */
-    bad_lo = 6000;
-    bad_hi = 6004;
-    read_through(5200, 6200);
-    CHECK(laser_unreadable_blocks(1, 6000, 1000) == 4);
+    /* Another spot, well past the first - out of its weak zone: narrowed
+     * down too, not skipped. */
+    bad_lo = 10000;
+    bad_hi = 10004;
+    read_through(5200, 10200);
+    CHECK(laser_unreadable_blocks(1, 10000, 1000) == 4);
+}
+
+static void weak_zone_is_skipped(void)
+{
+    check_case("a weak zone, spots 160 blocks apart");
+    fresh_disc();
+    bad_mode = BAD_SPOTS;
+    bad_lo = 20000;
+    bad_hi = 21280;
+
+    spot_failures = 0;
+    read_through(19000, 23000);
+
+    /* The first spot narrowed down, after landing again - five failed
+     * reads, the failure, its second try and three narrowing down - and the
+     * stretch after it skipped after one; then each spot reached skipped
+     * after one failed read: 256 blocks cover the next one, so every other
+     * spot. About ten in all, not the forty-odd of eight spots narrowed
+     * down. */
+    CHECK(spot_failures <= 12);
+    CHECK(laser_unreadable_blocks(1, 19999, 1) == 0);
+    CHECK(laser_unreadable_blocks(1, 20000, 4) == 4);
+    /* At most as many blocks as the zone held lost past it. */
+    CHECK(laser_unreadable_blocks(1, 21280 + 1280, 1) == 0);
 }
 
 static void blocks_sent_before_a_medium_error_are_returned(void)
@@ -523,9 +698,12 @@ int main(void)
     blocks_sent_before_a_stall_are_returned();
     failed_landing_is_read_after_landing_again();
     landing_again_is_once_a_read();
+    lost_drive_is_restarted();
     read_ahead_does_not_land_again();
     damaged_stretch_is_skipped();
+    dead_band_is_crossed();
     lone_bad_blocks_stay_narrow();
+    weak_zone_is_skipped();
     blocks_sent_before_a_medium_error_are_returned();
 
     return check_result();

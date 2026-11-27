@@ -273,12 +273,19 @@ static void begin(const char *name, void (*s)(const uint8_t *, int))
  * errors, or one attempt not answered. */
 static uint8_t block[2048];
 
-static laser_status_t read_block(laser_failure_t *why, int max_resets)
+/* One block at @p lba, read the same way. */
+static laser_status_t read_block_at(laser_failure_t *why, int max_resets, uint32_t lba)
 {
-    static const uint8_t cdb[10] = { OP_READ_10, 0, 0, 0, 0, 100, 0, 0, 1, 0 };
+    const uint8_t cdb[10] = { OP_READ_10, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16),
+                              (uint8_t)(lba >> 8), (uint8_t)lba, 0, 0, 1, 0 };
     int actual = 0;
     return laser_scsi_cdb_read(1, cdb, sizeof(cdb), block, sizeof(block), 1,
                                &actual, 2, max_resets, why);
+}
+
+static laser_status_t read_block(laser_failure_t *why, int max_resets)
+{
+    return read_block_at(why, max_resets, 100);
 }
 
 /* READ TOC's CD-Text header, sent once in @p timeout_ms. */
@@ -533,18 +540,28 @@ static void seek_failures(void)
 {
     laser_failure_t why;
 
-    begin("no seek complete, again and again: the supply named, once",
+    begin("no seek complete, in three places: the supply named, once",
           reads_fail);
     sense_key = 3, sense_asc = 0x02, sense_ascq = 0;
     entry.seek_failures = entry.seek_warned = 0;
     seek_warnings = 0;
-    /* Two attempts a read: the third failure is in the second read. */
-    CHECK(read_block(&why, 2) == LASER_ERR_IO);
+    CHECK(read_block_at(&why, 2, 100) == LASER_ERR_IO);
+    CHECK(read_block_at(&why, 2, 1000000) == LASER_ERR_IO);
     CHECK(seek_warnings == 0);
-    CHECK(read_block(&why, 2) == LASER_ERR_IO);
+    CHECK(read_block_at(&why, 2, 10914784) == LASER_ERR_IO);
     CHECK(seek_warnings == 1);
-    CHECK(read_block(&why, 2) == LASER_ERR_IO);
+    CHECK(read_block_at(&why, 2, 20000000) == LASER_ERR_IO);
     CHECK(seek_warnings == 1);
+
+    begin("no seek complete, again and again in one place: not the supply",
+          reads_fail);
+    entry.seek_failures = entry.seek_warned = 0;
+    seek_warnings = 0;
+    for (int i = 0; i < 4; i++)
+        CHECK(read_block_at(&why, 2, 10914784 + 32 * (uint32_t)i) == LASER_ERR_IO);
+    /* Nor with block 0 failing as well: two places. */
+    CHECK(read_block_at(&why, 2, 0) == LASER_ERR_IO);
+    CHECK(seek_warnings == 0);
 
     begin("an unreadable sector: not taken for the supply", reads_fail);
     sense_key = 3, sense_asc = 0x11, sense_ascq = 5;

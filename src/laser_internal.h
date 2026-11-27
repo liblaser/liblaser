@@ -181,6 +181,23 @@ typedef struct {
     uint32_t ahead_medium_lba;
     uint32_t ahead_medium_count;
 
+    /* A drive that lost its way: the disc restarted before the next read
+     * sent to it (restart_pending), and the restarts made in the area of
+     * the disc around restart_area_lba, at most LASER_RESTARTS_PER_AREA.
+     * Forgotten when the disc changes. See land_again() in read.c. Under
+     * learnt_lock. */
+    int      restart_pending;
+    uint32_t restart_area_lba;
+    int      restarts_in_area;
+
+    /* The band of the disc being skipped: from band_start to band_end, the
+     * last skip band_skip blocks long, 0 when none. A failure in it, or at
+     * most LASER_WEAK_ZONE_BLOCKS past it, skips twice as far. Forgotten
+     * when the disc changes. See band_skip() in read.c. Under learnt_lock. */
+    uint32_t band_start;
+    uint32_t band_end;
+    uint32_t band_skip;
+
     /* Single blocks a READ(10) was refused on - a positional status, see
      * laser_status_is_positional() - with the status, and how many times:
      * 0 hits for an empty slot. A read reaching one stops short of it; one
@@ -286,9 +303,11 @@ typedef struct {
     uint64_t xfer_us;
     uint64_t xfer_count;
     int      slow_warned;
-    /* Medium errors answered "no seek complete" (03/02/00) since the
-     * registration, and whether that has been reported: see
+    /* The places the drive answered "no seek complete" (03/02/00) since the
+     * registration, as the block of the read that failed - the first few,
+     * as many as seek_failures - and whether that has been reported: see
      * note_seek_failure_locked() in scsi.c. Under io_lock. */
+    uint32_t seek_places[3];
     int      seek_failures;
     int      seek_warned;
     /* The block after the last successful read: only a read starting there

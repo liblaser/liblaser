@@ -59,6 +59,41 @@
 #define LASER_STRETCH_GAP_BLOCKS  64
 #define LASER_STRETCH_MAX_BLOCKS  1024
 
+/* A medium error at most this many blocks past a range recorded unreadable,
+ * farther than LASER_STRETCH_GAP_BLOCKS, is a weak zone of the disc: spots a
+ * few hundred blocks apart that do not read between others that do - the
+ * first 1250 blocks of a dual-layer BD's second layer, five spots each
+ * costing a drive fifteen seconds of landing again and narrowing down, more
+ * than a minute of a frozen film. Skipped instead: this many blocks from the
+ * spot recorded at once, after one failed command - 512 KiB, a fraction of a
+ * second of a BD's film. See read_chunked(). */
+#define LASER_WEAK_ZONE_BLOCKS      4096
+#define LASER_WEAK_ZONE_SKIP_BLOCKS 256
+
+/* The skips above - a damaged stretch's, a weak zone's, a lost drive's -
+ * start a band of the disc: a failure in it, or at most
+ * LASER_WEAK_ZONE_BLOCKS blocks past its end, skips twice as far as the
+ * skip before, without limit (band_skip()). A dual-layer BD had two
+ * damaged areas thousands of blocks long - at its second layer's start,
+ * and 1.3 million blocks into it - that a drive failed on a box, a phone
+ * and a PC alike, with failures of up to eleven seconds and readable blocks
+ * here and there between them: skips of at most 1024 blocks took minutes
+ * there, doubling skips cross an area in a few failures. A band that does
+ * not end is skipped to the disc's end, where the read is refused, which
+ * ends the title. The cost: up to as many readable blocks as the band held
+ * skipped past its end. */
+
+/* A drive lost its way and still fails the blocks after the disc restarted:
+ * this many from them are recorded unreadable at once - 4 MiB, a second or
+ * two of a BD's film - and the disc restarted again before the next read,
+ * for the drive to reach what follows with its bearings. A BD drive on a
+ * box failed so in the weak first 1250 blocks of a disc's second layer,
+ * which a PC read through. At most LASER_RESTARTS_PER_AREA restarts within
+ * LASER_LAND_AGAIN_DISTANCE blocks: a drive that restarting does not help
+ * gives up there, rather than spend a quarter of a minute on each. */
+#define LASER_LOST_SKIP_BLOCKS    2048
+#define LASER_RESTARTS_PER_AREA   2
+
 /* Build the CDB for one chunk - the only thing the two public helpers below
  * do differently. */
 typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
@@ -243,13 +278,161 @@ static int take_ahead_medium(laser_entry_t *entry, uint32_t lba)
     return hit;
 }
 
-/* Sends the drive away from @p lba and lets it come back: one block read
- * LASER_LAND_AGAIN_DISTANCE blocks off - block 0, or past @p lba near the
- * start of the disc - into a buffer of its own and for nothing else. Its
- * outcome does not matter: past the end of a small disc it is refused at
- * once, which is a seek all the same. Nothing recorded.
+/* Whether @p st ends a read whatever else is going on. */
+static int read_must_end(laser_status_t st)
+{
+    return st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
+           st == LASER_ERR_CANCELLED;
+}
+
+/* Stops the disc and starts it again: START STOP UNIT, without IMMED, the
+ * stop then the start - each answered once the spindle has stopped or the
+ * drive is ready again, and given the time for it (SLOW_CSW_PHASE_TIMEOUT_MS
+ * in bot.c). A drive starting a disc focuses and calibrates again, as it
+ * does for a disc put in: what brings back one that has lost its way on it.
+ * The tray stays as it is.
  *
  * Returns 0, or LASER_ERR_MEDIA_GONE, LASER_ERR_NO_DEVICE or
+ * LASER_ERR_CANCELLED, which end the read. */
+static int restart_disc(laser_entry_t *entry, int token)
+{
+    static const uint8_t stop[6]  = { 0x1b, 0x00, 0x00, 0x00, 0x00 /* STOP */, 0x00 };
+    static const uint8_t start[6] = { 0x1b, 0x00, 0x00, 0x00, 0x01 /* START */, 0x00 };
+
+    if (laser_must_stop(entry)) {
+        return (int)LASER_ERR_CANCELLED;
+    }
+    const int64_t started = laser_monotonic_ms_now();
+    laser_status_t st = laser_scsi_cdb(token, stop, sizeof(stop), NULL, 0, 0, NULL);
+    if (read_must_end(st)) {
+        return (int)st;
+    }
+    st = laser_scsi_cdb(token, start, sizeof(start), NULL, 0, 0, NULL);
+    if (read_must_end(st)) {
+        return (int)st;
+    }
+    LOGI("token=%d: disc stopped and started again (%d ms)%s", token,
+         (int)(laser_monotonic_ms_now() - started),
+         st == LASER_OK ? "" : ", the start not confirmed");
+    return 0;
+}
+
+/* Whether the disc may be restarted for a read at @p lba - and counted if
+ * so: at most LASER_RESTARTS_PER_AREA times within LASER_LAND_AGAIN_DISTANCE
+ * blocks of the first restart of the area. */
+static int may_restart(laser_entry_t *entry, uint32_t lba)
+{
+    int ok = 1;
+
+    pthread_mutex_lock(&entry->learnt_lock);
+    const uint32_t area = entry->restart_area_lba;
+    const uint32_t distance = lba > area ? lba - area : area - lba;
+    if (entry->restarts_in_area == 0 || distance >= LASER_LAND_AGAIN_DISTANCE) {
+        entry->restart_area_lba = lba;
+        entry->restarts_in_area = 0;
+    }
+    if (entry->restarts_in_area >= LASER_RESTARTS_PER_AREA) {
+        ok = 0;
+    } else {
+        entry->restarts_in_area++;
+    }
+    pthread_mutex_unlock(&entry->learnt_lock);
+
+    return ok;
+}
+
+/* Whether may_restart() would allow a restart for a read at @p lba, nothing
+ * counted. */
+static int restarts_left(laser_entry_t *entry, uint32_t lba)
+{
+    pthread_mutex_lock(&entry->learnt_lock);
+    const uint32_t area = entry->restart_area_lba;
+    const uint32_t distance = lba > area ? lba - area : area - lba;
+    const int left = entry->restarts_in_area == 0 ||
+                     distance >= LASER_LAND_AGAIN_DISTANCE ||
+                     entry->restarts_in_area < LASER_RESTARTS_PER_AREA;
+    pthread_mutex_unlock(&entry->learnt_lock);
+    return left;
+}
+
+/* A drive found lost after a restart: the disc is restarted again before
+ * the next read sent to it - see LASER_LOST_SKIP_BLOCKS. */
+static void restart_before_next_read(laser_entry_t *entry)
+{
+    pthread_mutex_lock(&entry->learnt_lock);
+    entry->restart_pending = 1;
+    pthread_mutex_unlock(&entry->learnt_lock);
+}
+
+/* Restarts the disc if restart_before_next_read() asked for it and the area
+ * of @p lba allows it. Returns as restart_disc(). */
+static int restart_if_pending(laser_entry_t *entry, int token, uint32_t lba)
+{
+    pthread_mutex_lock(&entry->learnt_lock);
+    const int pending = entry->restart_pending;
+    entry->restart_pending = 0;
+    pthread_mutex_unlock(&entry->learnt_lock);
+
+    if (!pending) {
+        return 0;
+    }
+    if (!may_restart(entry, lba)) {
+        LOGW("token=%d: LBA %u: the drive lost its way again here, not "
+             "restarting the disc another time", token, lba);
+        return 0;
+    }
+    LOGI("token=%d: LBA %u: restarting the disc before reading on", token, lba);
+    return restart_disc(entry, token);
+}
+
+/* One block read at @p away, into a buffer of its own and for nothing else,
+ * through the command layer's own retries: a seek. Its outcome does not
+ * matter, but whether the drive failed to read it - a medium error, or no
+ * answer - which says @p *lost: block 0 of a disc reads. Past the end of a
+ * small disc, it is refused at once, which is a seek all the same.
+ *
+ * Returns 0, or LASER_ERR_MEDIA_GONE, LASER_ERR_NO_DEVICE or
+ * LASER_ERR_CANCELLED, which end the read. */
+static int seek_to(int token, uint32_t away, int block_size, int cdb_len,
+                   build_read_cdb_fn build_cdb, const void *ctx, int *lost)
+{
+    *lost = 0;
+    uint8_t *scratch = malloc((size_t)block_size);
+    if (scratch == NULL) {
+        return 0;
+    }
+    uint8_t cdb[16];
+    memset(cdb, 0, sizeof(cdb));
+    build_cdb(cdb, away, 1, ctx);
+    int actual_len = 0;
+    laser_failure_t why;
+    const laser_status_t st =
+        laser_scsi_cdb_read(token, cdb, cdb_len, scratch, block_size,
+                            /* data_in = */ 1, &actual_len, 1, 1, &why);
+    free(scratch);
+    if (read_must_end(st)) {
+        return (int)st;
+    }
+    *lost = st == LASER_ERR_IO && (why.cause == LASER_FAILURE_MEDIUM ||
+                                   why.cause == LASER_FAILURE_NO_ANSWER);
+    return 0;
+}
+
+/* Sends the drive away from @p lba and lets it come back: one block read
+ * LASER_LAND_AGAIN_DISTANCE blocks off - block 0, or past @p lba near the
+ * start of the disc. Nothing recorded.
+ *
+ * A DRIVE FAILING THAT BLOCK TOO HAS LOST ITS WAY: block 0 reads on any disc.
+ * A BD drive reading across into a disc's second layer failed there - at
+ * the same place on a PC as on a box - and from then on read nothing, block
+ * 0 included, every skip past the failure costing seconds for nothing. The
+ * same place reached directly, from elsewhere, read. So the disc is stopped
+ * and started again (restart_disc()), the drive sent away once more, and the
+ * caller reads the blocks again: reached directly, after the restart -
+ * LASER_RESTARTS_PER_AREA times at most in one area of the disc.
+ *
+ * Returns 0, 1 if the drive was found lost - the disc restarted, or not
+ * allowed to be again - or LASER_ERR_MEDIA_GONE, LASER_ERR_NO_DEVICE or
  * LASER_ERR_CANCELLED, which end the read. */
 static int land_again(laser_entry_t *entry, int token, uint32_t lba,
                       int block_size, int cdb_len, build_read_cdb_fn build_cdb,
@@ -260,29 +443,39 @@ static int land_again(laser_entry_t *entry, int token, uint32_t lba,
     }
     const uint32_t away = lba >= LASER_LAND_AGAIN_DISTANCE
                         ? 0 : lba + LASER_LAND_AGAIN_DISTANCE;
-    uint8_t *scratch = malloc((size_t)block_size);
-    if (scratch == NULL) {
-        return 0;
-    }
 
     const int64_t started = laser_monotonic_ms_now();
-    uint8_t cdb[16];
-    memset(cdb, 0, sizeof(cdb));
-    build_cdb(cdb, away, 1, ctx);
-    int actual_len = 0;
-    const laser_status_t st =
-        laser_scsi_cdb_read(token, cdb, cdb_len, scratch, block_size,
-                            /* data_in = */ 1, &actual_len, 1, 1, NULL);
-    free(scratch);
-    if (st == LASER_ERR_MEDIA_GONE || st == LASER_ERR_NO_DEVICE ||
-        st == LASER_ERR_CANCELLED) {
-        return (int)st;
+    int lost = 0;
+    int restarted = 0;
+    int r = seek_to(token, away, block_size, cdb_len, build_cdb, ctx, &lost);
+    if (r < 0) {
+        return r;
+    }
+    if (lost && !may_restart(entry, lba)) {
+        LOGW("token=%d: LBA %u: the drive failed LBA %u too - lost its way "
+             "again here, not restarting the disc another time", token, lba,
+             away);
+        return 1;
+    }
+    if (lost) {
+        LOGW("token=%d: LBA %u: the drive failed LBA %u too - lost its way, "
+             "stopping and starting the disc", token, lba, away);
+        r = restart_disc(entry, token);
+        if (r < 0) {
+            return r;
+        }
+        restarted = 1;
+        r = seek_to(token, away, block_size, cdb_len, build_cdb, ctx, &lost);
+        if (r < 0) {
+            return r;
+        }
     }
 
-    LOGI("token=%d: LBA %u: away to LBA %u and back (%d ms), reading it "
+    LOGI("token=%d: LBA %u: away to LBA %u and back (%d ms)%s, reading it "
          "again", token, lba, away,
-         (int)(laser_monotonic_ms_now() - started));
-    return 0;
+         (int)(laser_monotonic_ms_now() - started),
+         lost ? ", failing it still" : "");
+    return restarted;
 }
 
 /* The length of the range recorded unreadable that holds @p lba, or ends at
@@ -309,10 +502,41 @@ static uint32_t stretch_before(laser_entry_t *entry, uint32_t lba)
     return longest;
 }
 
+/* How many blocks from @p lba a skip records: @p first, or twice the skip
+ * before if @p lba is in the band being skipped or at most
+ * LASER_WEAK_ZONE_BLOCKS past it - see LASER_WEAK_ZONE_SKIP_BLOCKS. Never
+ * past the last block an LBA can name. */
+static int band_skip(laser_entry_t *entry, uint32_t lba, int first)
+{
+    uint64_t skip = (uint64_t)first;
+
+    pthread_mutex_lock(&entry->learnt_lock);
+    if (entry->band_skip != 0 && lba >= entry->band_start &&
+        lba <= (uint64_t)entry->band_end + LASER_WEAK_ZONE_BLOCKS) {
+        if ((uint64_t)entry->band_skip * 2 > skip) {
+            skip = (uint64_t)entry->band_skip * 2;
+        }
+    } else {
+        entry->band_start = lba;
+    }
+    if (skip > (uint64_t)UINT32_MAX - lba) {
+        skip = (uint64_t)UINT32_MAX - lba;
+    }
+    if (skip > INT32_MAX) {
+        skip = INT32_MAX;
+    }
+    entry->band_end = lba + (uint32_t)skip;
+    entry->band_skip = (uint32_t)skip;
+    pthread_mutex_unlock(&entry->learnt_lock);
+
+    return (int)skip;
+}
+
 /* A medium error at @p lba, in a damaged stretch whose recorded range before
  * it holds @p stretch blocks: the blocks from @p lba are recorded unreadable
  * without asking the drive for them - as many as @p stretch, at least the
- * @p chunk that failed, LASER_STRETCH_MAX_BLOCKS at most. */
+ * @p chunk that failed, LASER_STRETCH_MAX_BLOCKS at most; or more in a band
+ * already being skipped, see band_skip(). */
 static void skip_stretch(laser_entry_t *entry, int token, uint32_t lba,
                          int chunk, uint32_t stretch)
 {
@@ -323,9 +547,43 @@ static void skip_stretch(laser_entry_t *entry, int token, uint32_t lba,
     if (skip > LASER_STRETCH_MAX_BLOCKS) {
         skip = LASER_STRETCH_MAX_BLOCKS;
     }
+    skip = (uint32_t)band_skip(entry, lba, (int)skip);
     LOGI("token=%d: LBA %u: a medium error %u block(s) into a damaged "
          "stretch, skipping %u blocks", token, lba, stretch, skip);
     remember_unreadable(entry, token, lba, (int)skip);
+}
+
+/* Whether a range recorded unreadable ends at most LASER_WEAK_ZONE_BLOCKS
+ * blocks before @p lba: @p lba is then in a weak zone of the disc. */
+static int in_weak_zone(laser_entry_t *entry, uint32_t lba)
+{
+    int found = 0;
+
+    pthread_mutex_lock(&entry->learnt_lock);
+    for (unsigned i = 0; i < LASER_UNREADABLE_SLOTS && !found; i++) {
+        const uint64_t start = entry->unreadable[i].lba;
+        const uint32_t count = entry->unreadable[i].count;
+        found = count != 0 && lba >= start &&
+                lba <= start + count + LASER_WEAK_ZONE_BLOCKS;
+    }
+    pthread_mutex_unlock(&entry->learnt_lock);
+
+    return found;
+}
+
+/* A medium error at @p lba, in a weak zone: LASER_WEAK_ZONE_SKIP_BLOCKS
+ * blocks from it recorded unreadable without asking the drive for them - at
+ * least the @p chunk that failed; more in a band already being skipped, see
+ * band_skip(). */
+static void skip_weak_zone(laser_entry_t *entry, int token, uint32_t lba,
+                           int chunk)
+{
+    const int skip = band_skip(entry, lba,
+                               chunk > LASER_WEAK_ZONE_SKIP_BLOCKS
+                               ? chunk : LASER_WEAK_ZONE_SKIP_BLOCKS);
+    LOGI("token=%d: LBA %u: a medium error in a weak zone of the disc, "
+         "skipping %d blocks", token, lba, skip);
+    remember_unreadable(entry, token, lba, skip);
 }
 
 /* A READ(10) of the single block @p lba was refused with @p status. Logged
@@ -414,6 +672,11 @@ void laser_disc_changed_locked(laser_entry_t *entry)
     entry->unreadable_total = 0;
     entry->ahead_medium_count = 0;
     memset(entry->refused, 0, sizeof(entry->refused));
+    entry->restart_pending = 0;
+    entry->restarts_in_area = 0;
+    entry->band_start = 0;
+    entry->band_end = 0;
+    entry->band_skip = 0;
     pthread_mutex_unlock(&entry->learnt_lock);
     entry->unanswered_count = 0;
     entry->media_generation++;
@@ -578,6 +841,13 @@ int laser_refused_for_good(int token, uint32_t lba)
  * Only for READ(10), a DVD's or a BD's blocks: a CD's tracks are read in
  * order.
  *
+ * A drive failing the block it is sent away to as well has lost its way:
+ * the disc is stopped and started again before the chunk is read again -
+ * see land_again(). Failing after that too, LASER_LOST_SKIP_BLOCKS blocks
+ * from it are recorded at once, not narrowed down - each smaller read would
+ * cost the drive's seconds of trying for nothing - and the disc restarted
+ * again before the next read sent to the drive.
+ *
  * THE BLOCKS A MEDIUM ERROR LEAVES READ. A drive failing a read on a bad
  * block has most often sent the blocks before it: they are returned, and
  * the bad ones start after them - LASER_MEDIUM_NARROW_MIN_BLOCKS of them are
@@ -598,6 +868,20 @@ int laser_refused_for_good(int token, uint32_t lba)
  * any.
  * A read made ahead failing in a stretch records nothing, as ever: the
  * reader's read that follows skips at once, without the drive.
+ *
+ * A WEAK ZONE IS SKIPPED TOO. A medium error farther past a range recorded
+ * unreadable, but at most LASER_WEAK_ZONE_BLOCKS blocks, is another spot of
+ * a weak zone: LASER_WEAK_ZONE_SKIP_BLOCKS blocks from it are recorded at
+ * once (skip_weak_zone()), neither landing again nor narrowing down - one
+ * failed command a spot rather than seven, and readable blocks between the
+ * spots lost with them. Only for READ(10), and not after a NO SEEK COMPLETE
+ * while the area allows a restart: a drive that may have lost its way lands
+ * again, which finds out.
+ *
+ * A BAND OF THE DISC IS CROSSED. Each of those skips doubles the one before
+ * in the same band - see LASER_WEAK_ZONE_SKIP_BLOCKS - so that a band that
+ * does not read at all is crossed in a dozen failures, or the title ended
+ * at the disc's end, not frozen for hours.
  *
  * @param entry      the token's entry, pinned by the caller, for the
  *                   transfer cap and the blocks known not to read; NULL for
@@ -655,6 +939,8 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
      * read now is the one read again after it. */
     int land_again_done = 0;
     int land_again_retry = 0;
+    /* Whether the drive was found lost, landing again for it. */
+    int restarted = 0;
 
     while (blocks_done < num_blocks) {
         /* Re-read every time round: another thread on the same drive may
@@ -698,11 +984,25 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                 skip_stretch(entry, token, at, chunk, stretch);
                 return blocks_done > 0 ? blocks_done : (int)LASER_ERR_IO;
             }
+            /* In a weak zone: skipped as well - see "a weak zone is
+             * skipped too" above. */
+            if (refusals && in_weak_zone(entry, at)) {
+                skip_weak_zone(entry, token, at, chunk);
+                return blocks_done > 0 ? blocks_done : (int)LASER_ERR_IO;
+            }
             medium_since = laser_monotonic_ms_now();
             medium_split = 1;
             if (chunk > LASER_MEDIUM_NARROW_MIN_BLOCKS) {
                 split_cap = (chunk / 2) * block_size;
                 continue;
+            }
+        }
+
+        /* A drive found lost in an earlier read: restarted first. */
+        if (entry != NULL) {
+            const int r = restart_if_pending(entry, token, at);
+            if (r < 0) {
+                return blocks_done > 0 ? blocks_done : r;
             }
         }
 
@@ -796,6 +1096,14 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                      * damaged stretch is skipped" above. */
                     blocks_done += sent;
                     skip_stretch(entry, token, bad, left, stretch);
+                } else if (refusals && !land_again_done &&
+                           (why.asc != SCSI_ASC_NO_SEEK_COMPLETE ||
+                            !restarts_left(entry, bad)) &&
+                           in_weak_zone(entry, bad)) {
+                    /* Another spot of a weak zone: skipped - see "a weak
+                     * zone is skipped too" above. */
+                    blocks_done += sent;
+                    skip_weak_zone(entry, token, bad, left);
                 } else if (sent == 0 && refusals && !land_again_done) {
                     /* Maybe a landing the drive failed: away and back, then
                      * the chunk again - see "a medium error is read again
@@ -808,6 +1116,7 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                     if (r < 0) {
                         return r;
                     }
+                    restarted = r;
                     land_again_retry = 1;
                     medium_since = 0;
                     continue;
@@ -817,7 +1126,19 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                              "landing again too", token, at, chunk);
                         land_again_retry = 0;
                     }
-                    if (sent > 0) {
+                    if (restarted) {
+                        /* Lost, and failing after a restart: past the
+                         * blocks, the disc restarted for what follows -
+                         * see LASER_LOST_SKIP_BLOCKS. */
+                        const int skip = band_skip(entry, bad,
+                                left > LASER_LOST_SKIP_BLOCKS
+                                ? left : LASER_LOST_SKIP_BLOCKS);
+                        blocks_done += sent;
+                        LOGW("token=%d: LBA %u: the drive still fails here, "
+                             "skipping %d blocks", token, bad, skip);
+                        remember_unreadable(entry, token, bad, skip);
+                        restart_before_next_read(entry);
+                    } else if (sent > 0) {
                         /* Where the bad blocks start is known: what
                          * narrowing down would find, without its failed
                          * commands - see "the blocks a medium error leaves

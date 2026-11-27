@@ -407,13 +407,20 @@ static void sample_throughput_locked(laser_entry_t *entry, int data_len,
          (unsigned long long)per_ms, entry->ep_max_packet);
 }
 
-/* Seek failures - MEDIUM ERROR, NO SEEK COMPLETE - before they are reported
- * as a sign of the drive's supply: one is a disc's flaw, a few in a session
- * are not. */
+/* Places with a seek failure - MEDIUM ERROR, NO SEEK COMPLETE - before they
+ * are reported as a sign of the drive's supply: one is a disc's flaw, or the
+ * drive's at one place, a few far apart are not. Places closer than
+ * LASER_SEEK_PLACE_BLOCKS are one. */
 #define LASER_SEEK_FAILURES_WARN 3
+#define LASER_SEEK_PLACE_BLOCKS  65536
 
-/* Counts the drive's "no seek complete" answers, and reports once per
- * registration, when they keep coming, that the supply may be the cause.
+_Static_assert(LASER_SEEK_FAILURES_WARN <=
+               sizeof(((laser_entry_t *)0)->seek_places) / sizeof(uint32_t),
+               "seek_places too small");
+
+/* Counts the places where the drive answered "no seek complete" to a read
+ * of @p lba, and reports once per registration, when they keep coming,
+ * that the supply may be the cause.
  *
  * The other face of an underpowered drive, beside the slow reads above: a
  * drive on a supply that sags or ripples under the current of a seek - a
@@ -423,23 +430,36 @@ static void sample_throughput_locked(laser_entry_t *entry, int data_len,
  * and read the same zone on a PC's USB 3 port alone. Nothing in the
  * commands cures it; a powered hub with a regulated supply does.
  *
+ * Counted by place, not by failure: a drive failing again and again at one
+ * place is not short of power. A BD drive did so on a PC as on a box, at
+ * the start of a disc's second layer, read across from the first - and
+ * read it reached directly.
+ *
  * Caller MUST already hold entry->io_lock. */
 static void note_seek_failure_locked(laser_entry_t *entry, uint8_t sense_key,
-                                     uint8_t asc)
+                                     uint8_t asc, uint32_t lba)
 {
     if (sense_key != SCSI_SENSE_KEY_MEDIUM_ERROR ||
         asc != SCSI_ASC_NO_SEEK_COMPLETE || entry->seek_warned) {
         return;
     }
-    if (++entry->seek_failures < LASER_SEEK_FAILURES_WARN) {
+    for (int i = 0; i < entry->seek_failures; i++) {
+        const uint32_t place = entry->seek_places[i];
+        const uint32_t distance = lba > place ? lba - place : place - lba;
+        if (distance < LASER_SEEK_PLACE_BLOCKS) {
+            return;
+        }
+    }
+    entry->seek_places[entry->seek_failures++] = lba;
+    if (entry->seek_failures < LASER_SEEK_FAILURES_WARN) {
         return;
     }
     entry->seek_warned = 1;
 
     /* Kept under the log line limit (LOG_LINE_MAX in registry.c). */
-    LOGW("token=%d, usb %04x:%04x: the drive failed to seek %d times (sense "
-         "03/02/00) - a drive on a poor supply does this: try a powered hub "
-         "with a regulated supply rather than a charger or a Y cable",
+    LOGW("token=%d, usb %04x:%04x: the drive failed to seek in %d places "
+         "(sense 03/02/00) - a drive on a poor supply does this: try a "
+         "powered hub with a regulated supply, not a charger or a Y cable",
          entry->token, entry->vid, entry->pid, entry->seek_failures);
 }
 
@@ -1042,7 +1062,7 @@ static laser_status_t scsi_cdb(int token, const uint8_t *cdb, int cdb_len,
         }
 
         if (is_read) {
-            note_seek_failure_locked(entry, sense_key, asc);
+            note_seek_failure_locked(entry, sense_key, asc, read_lba);
         }
 
         /* An unreadable sector: see LASER_READ_MAX_MEDIUM_ERRORS. The same
