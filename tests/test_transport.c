@@ -621,11 +621,11 @@ static void unanswered_reads(void)
     CHECK(why.cause == LASER_FAILURE_NO_ANSWER);
     CHECK(why.received == 0);
 
-    begin("a read-ahead not answered: one attempt, nobody blamed",
-          retries_then_deferred_sense);
+    begin("a read-ahead not answered in a read's whole time: one attempt, "
+          "the sectors to blame", retries_then_deferred_sense);
     CHECK(read_block(&why, 1) == LASER_ERR_IO);
     CHECK(sent[OP_READ_10] == 1);
-    CHECK(why.cause == LASER_FAILURE_OTHER);
+    CHECK(why.cause == LASER_FAILURE_NO_ANSWER);
 
     /* No begin(): the device goes on from the read-ahead above. */
     check_case("then the same block read: given up at once, the read-ahead "

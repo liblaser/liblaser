@@ -198,6 +198,13 @@ typedef struct {
     uint32_t band_end;
     uint32_t band_skip;
 
+    /* Where the stream of reads has got to: the block after the last chunk
+     * read, or after the last skip; 0 when nothing has been read since the
+     * disc changed. A chunk at most LASER_STREAM_GAP_BLOCKS from it carries
+     * the stream on; farther, it lands - the start of a playback, a seek.
+     * See in_stream() in read.c. Under learnt_lock. */
+    uint32_t stream_end;
+
     /* Single blocks a READ(10) was refused on - a positional status, see
      * laser_status_is_positional() - with the status, and how many times:
      * 0 hits for an empty slot. A read reaching one stops short of it; one

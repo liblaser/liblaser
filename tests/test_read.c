@@ -226,6 +226,9 @@ static void fresh_disc(void)
     stops = starts = 0;
     entry.restart_pending = 0;
     entry.restarts_in_area = 0;
+    entry.band_start = entry.band_end = entry.band_skip = 0;
+    /* No stream of reads under way: the next read lands. */
+    entry.stream_end = 0;
 }
 
 static uint8_t buffer[256 * 2048];
@@ -286,10 +289,59 @@ static void unanswered_read_is_recorded(void)
     bad_lo = 40;
     bad_hi = 41;
 
+    /* Landing: sent again once, then given up. */
     CHECK(laser_read_blocks(1, 32, 32, buffer) == LASER_ERR_IO);
+    CHECK(commands == 2);
     CHECK(recorded_ranges() == 1);
     /* Not narrowed down: the whole transfer is given up, and counted. */
     CHECK(laser_unreadable_total(1) == 32);
+}
+
+static void read_through(uint32_t from, uint32_t to);
+
+static void unanswered_in_a_stream_is_skipped(void)
+{
+    check_case("a read not answered in the middle of a stream");
+    fresh_disc();
+    bad_mode = BAD_NO_ANSWER;
+    bad_lo = 5000;
+    bad_hi = 5001;
+
+    /* The stream reaching it: the chunk not answered, not sent again, and
+     * 256 blocks from it skipped. */
+    CHECK(laser_read_blocks(1, 4904, 96, buffer) == 96);
+    commands = 0;
+    CHECK(laser_read_blocks(1, 5000, 32, buffer) == LASER_ERR_IO);
+    CHECK(commands == 1);
+    CHECK(laser_unreadable_blocks(1, 5000, 1000) == 256);
+
+    check_case("a read made ahead not answered in the middle of a stream");
+    fresh_disc();
+    bad_mode = BAD_NO_ANSWER;
+    bad_lo = 5000;
+    bad_hi = 5001;
+    CHECK(laser_read_blocks(1, 4904, 96, buffer) == 96);
+
+    /* Skipped by the read made ahead itself: the reader's read follows
+     * without the drive. */
+    commands = 0;
+    CHECK(laser_read_blocks_ahead(1, 5000, 128, buffer) == LASER_ERR_IO);
+    CHECK(commands == 1);
+    CHECK(laser_read_blocks(1, 5000, 32, buffer) == LASER_ERR_IO);
+    CHECK(commands == 1);
+    CHECK(laser_unreadable_blocks(1, 5000, 1000) == 256);
+
+    check_case("reads not answered all along a stream, skips doubling");
+    fresh_disc();
+    bad_mode = BAD_NO_ANSWER;
+    bad_lo = 5000;
+    bad_hi = 105000;
+    CHECK(laser_read_blocks(1, 4904, 96, buffer) == 96);
+    commands = 0;
+    read_through(5000, 120000);
+    /* 100000 blocks crossed in about ten failed reads, past them the
+     * readable blocks' commands. */
+    CHECK(commands < 12 + (120000 - 105000) / 32);
 }
 
 static void other_failure_records_nothing(void)
@@ -411,9 +463,10 @@ static void blocks_sent_before_a_stall_are_returned(void)
     bad_hi = 17;
     sends_partial = 1;
 
-    /* The 16 blocks it sent are returned, the rest recorded. */
+    /* The 16 blocks it sent are returned, the rest recorded - landing,
+     * after sending it again once. */
     CHECK(laser_read_blocks(1, 0, 32, buffer) == 16);
-    CHECK(commands == 1);
+    CHECK(commands == 2);
 
     commands = 0;
     CHECK(laser_read_blocks(1, 16, 16, buffer) == LASER_ERR_IO);
@@ -689,6 +742,7 @@ int main(void)
     medium_error_is_narrowed_and_recorded();
     ranges_that_touch_are_merged();
     unanswered_read_is_recorded();
+    unanswered_in_a_stream_is_skipped();
     other_failure_records_nothing();
     read_ahead_gives_up_at_once();
     read_ahead_stops_before_known_blocks();

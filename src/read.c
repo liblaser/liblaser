@@ -94,6 +94,11 @@
 #define LASER_LOST_SKIP_BLOCKS    2048
 #define LASER_RESTARTS_PER_AREA   2
 
+/* A chunk at most this many blocks from where the stream of reads has got
+ * to carries it on - the reader's reads, the reads made ahead of it, by a
+ * few MiB; farther, the drive lands somewhere new. 8 MiB. See in_stream(). */
+#define LASER_STREAM_GAP_BLOCKS 4096
+
 /* Build the CDB for one chunk - the only thing the two public helpers below
  * do differently. */
 typedef void (*build_read_cdb_fn)(uint8_t *cdb, uint32_t lba, int blocks,
@@ -502,6 +507,29 @@ static uint32_t stretch_before(laser_entry_t *entry, uint32_t lba)
     return longest;
 }
 
+/* Whether a chunk at @p lba carries on the stream of reads - see
+ * laser_entry_t::stream_end - rather than land somewhere new. */
+static int in_stream(laser_entry_t *entry, uint32_t lba)
+{
+    pthread_mutex_lock(&entry->learnt_lock);
+    const uint32_t end = entry->stream_end;
+    pthread_mutex_unlock(&entry->learnt_lock);
+
+    if (end == 0) {
+        return 0;
+    }
+    const uint32_t distance = lba > end ? lba - end : end - lba;
+    return distance <= LASER_STREAM_GAP_BLOCKS;
+}
+
+/* The stream of reads has got to @p end. */
+static void stream_reached(laser_entry_t *entry, uint32_t end)
+{
+    pthread_mutex_lock(&entry->learnt_lock);
+    entry->stream_end = end;
+    pthread_mutex_unlock(&entry->learnt_lock);
+}
+
 /* How many blocks from @p lba a skip records: @p first, or twice the skip
  * before if @p lba is in the band being skipped or at most
  * LASER_WEAK_ZONE_BLOCKS past it - see LASER_WEAK_ZONE_SKIP_BLOCKS. Never
@@ -527,6 +555,8 @@ static int band_skip(laser_entry_t *entry, uint32_t lba, int first)
     }
     entry->band_end = lba + (uint32_t)skip;
     entry->band_skip = (uint32_t)skip;
+    /* Reading on after the skip carries the stream on. */
+    entry->stream_end = entry->band_end;
     pthread_mutex_unlock(&entry->learnt_lock);
 
     return (int)skip;
@@ -582,6 +612,20 @@ static void skip_weak_zone(laser_entry_t *entry, int token, uint32_t lba,
                                chunk > LASER_WEAK_ZONE_SKIP_BLOCKS
                                ? chunk : LASER_WEAK_ZONE_SKIP_BLOCKS);
     LOGI("token=%d: LBA %u: a medium error in a weak zone of the disc, "
+         "skipping %d blocks", token, lba, skip);
+    remember_unreadable(entry, token, lba, skip);
+}
+
+/* A read in the stream not answered in a read's whole time, from @p lba:
+ * a band skipped - LASER_WEAK_ZONE_SKIP_BLOCKS blocks, at least the @p chunk
+ * not answered, more in a band already being skipped, see band_skip(). */
+static void skip_unanswered(laser_entry_t *entry, int token, uint32_t lba,
+                            int chunk)
+{
+    const int skip = band_skip(entry, lba,
+                               chunk > LASER_WEAK_ZONE_SKIP_BLOCKS
+                               ? chunk : LASER_WEAK_ZONE_SKIP_BLOCKS);
+    LOGI("token=%d: LBA %u: not answered in the middle of a stream, "
          "skipping %d blocks", token, lba, skip);
     remember_unreadable(entry, token, lba, skip);
 }
@@ -677,6 +721,7 @@ void laser_disc_changed_locked(laser_entry_t *entry)
     entry->band_start = 0;
     entry->band_end = 0;
     entry->band_skip = 0;
+    entry->stream_end = 0;
     pthread_mutex_unlock(&entry->learnt_lock);
     entry->unanswered_count = 0;
     entry->media_generation++;
@@ -878,6 +923,16 @@ int laser_refused_for_good(int token, uint32_t lba)
  * while the area allows a restart: a drive that may have lost its way lands
  * again, which finds out.
  *
+ * A READ NOT ANSWERED: AGAIN WHEN LANDING, SKIPPED IN A STREAM. A chunk the
+ * drive did not answer, carrying on the stream of reads (in_stream()), is
+ * the middle of a film running into a part of the disc the drive is stuck
+ * on: blocks from it are skipped at once, as a band (skip_unanswered()) -
+ * by the read made ahead too, when the drive had all of a read's time,
+ * which would otherwise send the next chunk to the drive for as long
+ * again, half a minute each. A chunk landing somewhere new - the start of a
+ * playback, a seek - is sent again once first: a drive landing takes its
+ * time, and the reader asked for these blocks.
+ *
  * A BAND OF THE DISC IS CROSSED. Each of those skips doubles the one before
  * in the same band - see LASER_WEAK_ZONE_SKIP_BLOCKS - so that a band that
  * does not read at all is crossed in a dozen failures, or the title ended
@@ -941,6 +996,8 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
     int land_again_retry = 0;
     /* Whether the drive was found lost, landing again for it. */
     int restarted = 0;
+    /* Whether a chunk not answered, landing, has been sent again. */
+    int unanswered_again = 0;
 
     while (blocks_done < num_blocks) {
         /* Re-read every time round: another thread on the same drive may
@@ -1073,6 +1130,14 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                     why.cause == LASER_FAILURE_MEDIUM) {
                     note_ahead_medium(entry, at, chunk);
                 }
+                /* Not answered in the middle of a stream: skipped - see "a
+                 * read not answered" above. */
+                if (entry != NULL && refusals && st == LASER_ERR_IO &&
+                    why.cause == LASER_FAILURE_NO_ANSWER &&
+                    in_stream(entry, at)) {
+                    skip_unanswered(entry, token, at + (uint32_t)sent,
+                                    chunk - sent);
+                }
                 blocks_done += sent;
             } else if (refusals && laser_status_is_positional(st)) {
                 /* A refusal fails the whole command: narrowed down to the
@@ -1193,8 +1258,21 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                  * From the first block the drive did not send: those it
                  * sent before stopping are returned, not lost with the
                  * rest of the chunk. */
-                remember_unreadable(entry, token, at + (uint32_t)sent,
+                if (refusals && in_stream(entry, at)) {
+                    /* In the middle of a stream: skipped - see "a read not
+                     * answered" above. */
+                    skip_unanswered(entry, token, at + (uint32_t)sent,
                                     chunk - sent);
+                } else if (refusals && !unanswered_again) {
+                    /* Landing: sent again, once. */
+                    LOGI("token=%d: LBA %u x %d not answered, landing: "
+                         "sending it again", token, at, chunk);
+                    unanswered_again = 1;
+                    continue;
+                } else {
+                    remember_unreadable(entry, token, at + (uint32_t)sent,
+                                        chunk - sent);
+                }
                 blocks_done += sent;
             }
 
@@ -1226,6 +1304,7 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
 
         if (entry != NULL) {
             raise_largest_ok(entry, chunk * block_size);
+            stream_reached(entry, at + (uint32_t)chunk);
         }
         if (land_again_retry) {
             LOGI("token=%d: LBA %u x %d read after landing again", token, at,

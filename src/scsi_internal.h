@@ -214,7 +214,8 @@ typedef enum {
     /* The drive did not answer the read at all - each attempt ending in a
      * Reset Recovery - while answering a TEST UNIT READY that it is ready,
      * or answering nothing since, or saying afterwards, in deferred sense,
-     * that it could not read: stuck on those sectors, as on the unreadable
+     * that it could not read - or, for a read made ahead, not answering in
+     * a read's whole time: stuck on those sectors, as on the unreadable
      * ones some protections put on purpose. With LASER_FAILURE_MEDIUM, the
      * two failures that are the disc's. */
     LASER_FAILURE_NO_ANSWER,

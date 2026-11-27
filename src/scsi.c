@@ -821,6 +821,12 @@ static laser_status_t scsi_cdb(int token, const uint8_t *cdb, int cdb_len,
                     entry->unanswered_long = entry->read_timed_out;
                     reason_logged = 1;
                     result = LASER_ERR_IO;
+                    /* Stuck on the sectors when it had all of a read's
+                     * time: for the caller to judge, see read_chunked() in
+                     * read.c. */
+                    if (why != NULL && entry->read_timed_out) {
+                        why->cause = LASER_FAILURE_NO_ANSWER;
+                    }
                     break;
                 }
 
