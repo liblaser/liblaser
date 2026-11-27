@@ -243,9 +243,10 @@ static void medium_error_is_narrowed_and_recorded(void)
     bad_lo = 100;
     bad_hi = 104;
 
-    /* The blocks before it are returned, and it alone is recorded. */
+    /* Landing on it: the blocks before it are returned, and it alone is
+     * recorded. */
     CHECK(laser_unreadable_total(1) == 0);
-    CHECK(laser_read_blocks(1, 0, 128, buffer) == 100);
+    CHECK(laser_read_blocks(1, 96, 32, buffer) == 4);
     CHECK(recorded_ranges() == 1);
     CHECK(laser_unreadable_blocks(1, 100, 128) == 4);
     CHECK(laser_unreadable_total(1) == 4);
@@ -362,22 +363,29 @@ static void other_failure_records_nothing(void)
 
 static void read_ahead_gives_up_at_once(void)
 {
-    check_case("a read-ahead reaching a bad region");
+    check_case("a read-ahead landing on a bad region");
     fresh_disc();
     bad_mode = BAD_MEDIUM;
     bad_lo = 100;
     bad_hi = 164;
 
-    /* Three chunks of 32 read, one command on the fourth, nothing kept
-     * against it. */
-    CHECK(laser_read_blocks_ahead(1, 0, 128, buffer) == 96);
-    CHECK(commands == 4);
-    CHECK(recorded_ranges() == 0);
-
-    commands = 0;
+    /* One command, nothing kept against it: the reader's read lands
+     * again. */
     CHECK(laser_read_blocks_ahead(1, 100, 128, buffer) == LASER_ERR_IO);
     CHECK(commands == 1);
     CHECK(recorded_ranges() == 0);
+
+    check_case("a read-ahead reaching a bad region in a stream");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 100;
+    bad_hi = 164;
+
+    /* Three chunks of 32 read, one command on the fourth: skipped from
+     * it, for the reader's read to follow without the drive. */
+    CHECK(laser_read_blocks_ahead(1, 0, 128, buffer) == 96);
+    CHECK(commands == 4);
+    CHECK(laser_unreadable_blocks(1, 96, 1000) == 256);
 }
 
 static void read_ahead_stops_before_known_blocks(void)
@@ -643,14 +651,14 @@ static void damaged_stretch_is_skipped(void)
     medium_failures = 0;
     read_through(9000, 30000);
 
-    /* The first failure narrowed down, after landing again - five failed
-     * reads - then skips doubling, one failed read each: about fifteen in
-     * all, not thousands. */
-    CHECK(medium_failures <= 20);
-    /* Nothing before it is lost, and at most as much again after it. */
-    CHECK(laser_unreadable_blocks(1, 9999, 1) == 0);
-    CHECK(laser_unreadable_blocks(1, 10000, 20000) >= 8000);
-    CHECK(laser_unreadable_blocks(1, 10000, 20000) <= 2 * 8000);
+    /* Met in a stream: skips doubling from the first failure, one failed
+     * read each - about ten in all, not thousands. */
+    CHECK(medium_failures <= 12);
+    /* Of the blocks before it, at most the chunk that failed is lost; past
+     * it, at most the last skip - as much as the scratch, about. */
+    CHECK(laser_unreadable_blocks(1, 10000 - 33, 1) == 0);
+    CHECK(laser_unreadable_blocks(1, 10000, 30000) >= 8000);
+    CHECK(laser_unreadable_blocks(1, 10000, 30000) <= 8000 + 8192 + 32);
 }
 
 static void dead_band_is_crossed(void)
@@ -664,11 +672,10 @@ static void dead_band_is_crossed(void)
 
     read_through(999000, 3000000);
 
-    /* The first failure narrowed down, after landing again - five failed
-     * reads - then a skip doubling at each failure: about twenty failed
-     * reads, not tens of thousands. */
-    CHECK(medium_failures <= 25);
-    CHECK(laser_unreadable_blocks(1, 999999, 1) == 0);
+    /* A skip doubling at each failure: about fifteen failed reads, not
+     * tens of thousands. */
+    CHECK(medium_failures <= 20);
+    CHECK(laser_unreadable_blocks(1, 1000000 - 33, 1) == 0);
     /* Read on past the band: at most as many blocks as it held lost after
      * it. */
     CHECK(laser_unreadable_blocks(1, 2400000 + 1400000, 1) == 0);
@@ -676,21 +683,42 @@ static void dead_band_is_crossed(void)
 
 static void lone_bad_blocks_stay_narrow(void)
 {
-    check_case("two bad spots far apart");
+    check_case("two bad spots far apart, landing on them");
     fresh_disc();
     bad_mode = BAD_MEDIUM;
     bad_lo = 5000;
     bad_hi = 5004;
 
-    read_through(4900, 5200);
+    /* Narrowed down: four blocks lost. */
+    laser_read_blocks(1, 5000, 32, buffer);
     CHECK(laser_unreadable_blocks(1, 5000, 1000) == 4);
 
     /* Another spot, well past the first - out of its weak zone: narrowed
      * down too, not skipped. */
     bad_lo = 10000;
     bad_hi = 10004;
-    read_through(5200, 10200);
+    entry.stream_end = 0;
+    laser_read_blocks(1, 10000, 32, buffer);
     CHECK(laser_unreadable_blocks(1, 10000, 1000) == 4);
+
+    check_case("two bad spots far apart, met in a stream");
+    fresh_disc();
+    bad_mode = BAD_MEDIUM;
+    bad_lo = 5000;
+    bad_hi = 5004;
+
+    /* Skipped at once, a fraction of a second: 256 blocks from the chunk
+     * that failed, at 4996. */
+    commands = 0;
+    read_through(4900, 5400);
+    CHECK(laser_unreadable_blocks(1, 4996, 1000) == 256);
+
+    /* Another, out of the first one's band: 256 blocks again, not twice
+     * as many, from the chunk that failed, at 9976. */
+    bad_lo = 10000;
+    bad_hi = 10004;
+    read_through(5400, 10400);
+    CHECK(laser_unreadable_blocks(1, 9976, 1000) == 256);
 }
 
 static void weak_zone_is_skipped(void)
@@ -704,14 +732,11 @@ static void weak_zone_is_skipped(void)
     spot_failures = 0;
     read_through(19000, 23000);
 
-    /* The first spot narrowed down, after landing again - five failed
-     * reads, the failure, its second try and three narrowing down - and the
-     * stretch after it skipped after one; then each spot reached skipped
-     * after one failed read: 256 blocks cover the next one, so every other
-     * spot. About ten in all, not the forty-odd of eight spots narrowed
-     * down. */
-    CHECK(spot_failures <= 12);
-    CHECK(laser_unreadable_blocks(1, 19999, 1) == 0);
+    /* Met in a stream: each spot reached skipped after one failed read,
+     * the skips doubling - a handful in all, not the forty-odd of eight
+     * spots narrowed down. */
+    CHECK(spot_failures <= 6);
+    CHECK(laser_unreadable_blocks(1, 20000 - 33, 1) == 0);
     CHECK(laser_unreadable_blocks(1, 20000, 4) == 4);
     /* At most as many blocks as the zone held lost past it. */
     CHECK(laser_unreadable_blocks(1, 21280 + 1280, 1) == 0);

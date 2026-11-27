@@ -616,18 +616,29 @@ static void skip_weak_zone(laser_entry_t *entry, int token, uint32_t lba,
     remember_unreadable(entry, token, lba, skip);
 }
 
-/* A read in the stream not answered in a read's whole time, from @p lba:
- * a band skipped - LASER_WEAK_ZONE_SKIP_BLOCKS blocks, at least the @p chunk
- * not answered, more in a band already being skipped, see band_skip(). */
-static void skip_unanswered(laser_entry_t *entry, int token, uint32_t lba,
-                            int chunk)
+/* A read in the stream failing from @p lba - not answered in a read's whole
+ * time, or a medium error, as @p what says: a band skipped -
+ * LASER_WEAK_ZONE_SKIP_BLOCKS blocks, at least the @p chunk that failed,
+ * more in a band already being skipped, see band_skip(). */
+static void skip_in_stream(laser_entry_t *entry, int token, uint32_t lba,
+                           int chunk, const char *what)
 {
     const int skip = band_skip(entry, lba,
                                chunk > LASER_WEAK_ZONE_SKIP_BLOCKS
                                ? chunk : LASER_WEAK_ZONE_SKIP_BLOCKS);
-    LOGI("token=%d: LBA %u: not answered in the middle of a stream, "
-         "skipping %d blocks", token, lba, skip);
+    LOGI("token=%d: LBA %u: %s in the middle of a stream, skipping %d "
+         "blocks", token, lba, what, skip);
     remember_unreadable(entry, token, lba, skip);
+}
+
+/* Whether a medium error answered with @p asc, at @p lba, is skipped in a
+ * stream: not a NO SEEK COMPLETE while the area allows a restart - a drive
+ * that may have lost its way lands again, which finds out. */
+static int skip_medium_in_stream(laser_entry_t *entry, uint32_t lba,
+                                 uint8_t asc)
+{
+    return in_stream(entry, lba) &&
+           (asc != SCSI_ASC_NO_SEEK_COMPLETE || !restarts_left(entry, lba));
 }
 
 /* A READ(10) of the single block @p lba was refused with @p status. Logged
@@ -923,15 +934,22 @@ int laser_refused_for_good(int token, uint32_t lba)
  * while the area allows a restart: a drive that may have lost its way lands
  * again, which finds out.
  *
- * A READ NOT ANSWERED: AGAIN WHEN LANDING, SKIPPED IN A STREAM. A chunk the
- * drive did not answer, carrying on the stream of reads (in_stream()), is
- * the middle of a film running into a part of the disc the drive is stuck
- * on: blocks from it are skipped at once, as a band (skip_unanswered()) -
- * by the read made ahead too, when the drive had all of a read's time,
- * which would otherwise send the next chunk to the drive for as long
- * again, half a minute each. A chunk landing somewhere new - the start of a
- * playback, a seek - is sent again once first: a drive landing takes its
- * time, and the reader asked for these blocks.
+ * A READ FAILING IN A STREAM IS SKIPPED; LANDING, IT IS TRIED AGAIN. A
+ * chunk carrying on the stream of reads (in_stream()) that the drive did
+ * not answer, or answered with a medium error, is the middle of a film
+ * running into a part of the disc the drive cannot read: blocks from it
+ * are skipped at once, as a band (skip_in_stream()), neither landing again
+ * nor narrowing down - by the read made ahead too, for a medium error or
+ * when the drive had all of a read's time, which would otherwise send the
+ * next chunk to the drive for as long again, up to half a minute each.
+ * The cost: a lone bad sector in a film skips LASER_WEAK_ZONE_SKIP_BLOCKS
+ * blocks, a fraction of a second. Not after a NO SEEK COMPLETE while the
+ * area allows a restart: a drive that may have lost its way lands again,
+ * which finds out. A chunk landing somewhere new - the start of a
+ * playback, a seek - is tried again first: sent again once when not
+ * answered, landed again and narrowed down after a medium error, as
+ * described above. Only for READ(10): a CD's sectors are narrowed down
+ * wherever they are, a second of silence being worth the commands.
  *
  * A BAND OF THE DISC IS CROSSED. Each of those skips doubles the one before
  * in the same band - see LASER_WEAK_ZONE_SKIP_BLOCKS - so that a band that
@@ -1126,8 +1144,16 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                  * wants these blocks reads them with the patience they are
                  * worth - narrowed down at once after a medium error. And
                  * nowhere to record without an entry. */
-                if (entry != NULL && st == LASER_ERR_IO &&
-                    why.cause == LASER_FAILURE_MEDIUM) {
+                if (entry != NULL && refusals && st == LASER_ERR_IO &&
+                    why.cause == LASER_FAILURE_MEDIUM &&
+                    skip_medium_in_stream(entry, at + (uint32_t)sent,
+                                          why.asc)) {
+                    /* In the middle of a stream: skipped - see "a read
+                     * failing in a stream" above. */
+                    skip_in_stream(entry, token, at + (uint32_t)sent,
+                                   chunk - sent, "a medium error");
+                } else if (entry != NULL && st == LASER_ERR_IO &&
+                           why.cause == LASER_FAILURE_MEDIUM) {
                     note_ahead_medium(entry, at, chunk);
                 }
                 /* Not answered in the middle of a stream: skipped - see "a
@@ -1135,8 +1161,8 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                 if (entry != NULL && refusals && st == LASER_ERR_IO &&
                     why.cause == LASER_FAILURE_NO_ANSWER &&
                     in_stream(entry, at)) {
-                    skip_unanswered(entry, token, at + (uint32_t)sent,
-                                    chunk - sent);
+                    skip_in_stream(entry, token, at + (uint32_t)sent,
+                                   chunk - sent, "not answered");
                 }
                 blocks_done += sent;
             } else if (refusals && laser_status_is_positional(st)) {
@@ -1161,6 +1187,13 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                      * damaged stretch is skipped" above. */
                     blocks_done += sent;
                     skip_stretch(entry, token, bad, left, stretch);
+                } else if (refusals && !land_again_done &&
+                           skip_medium_in_stream(entry, bad, why.asc)) {
+                    /* In the middle of a stream: skipped - see "a read
+                     * failing in a stream" above. */
+                    blocks_done += sent;
+                    skip_in_stream(entry, token, bad, left,
+                                   "a medium error");
                 } else if (refusals && !land_again_done &&
                            (why.asc != SCSI_ASC_NO_SEEK_COMPLETE ||
                             !restarts_left(entry, bad)) &&
@@ -1259,10 +1292,10 @@ static int read_chunked_entry(laser_entry_t *entry, int token, uint32_t lba,
                  * sent before stopping are returned, not lost with the
                  * rest of the chunk. */
                 if (refusals && in_stream(entry, at)) {
-                    /* In the middle of a stream: skipped - see "a read not
-                     * answered" above. */
-                    skip_unanswered(entry, token, at + (uint32_t)sent,
-                                    chunk - sent);
+                    /* In the middle of a stream: skipped - see "a read failing
+                     * in a stream" above. */
+                    skip_in_stream(entry, token, at + (uint32_t)sent,
+                                   chunk - sent, "not answered");
                 } else if (refusals && !unanswered_again) {
                     /* Landing: sent again, once. */
                     LOGI("token=%d: LBA %u x %d not answered, landing: "
