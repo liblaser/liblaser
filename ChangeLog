@@ -1,5 +1,6 @@
 XXXX-XX-XX: version 0.3.3
     - Add laser_scsi_cdb_once(), when a query may take too long and is not worth waiting for
+    - Improve skipping of a disc's unreadable area
 
 2026-11-24: version 0.3.2
     - Report when a device is not an optical drive
